@@ -1,0 +1,33 @@
+{
+  "common": {
+    "loading": "Cargando...",
+    "error": "Ocurrió un error",
+    "save": "Guardar",
+    "cancel": "Cancelar",
+    "send": "Enviar",
+    "search": "Buscar"
+  },
+  "auth": {
+    "signIn": "Iniciar Sesión",
+    "signUp": "Registrarse",
+    "signOut": "Cerrar Sesión",
+    "email": "Correo electrónico",
+    "password": "Contraseña"
+  },
+  "chat": {
+    "placeholder": "Escribe tu mensaje...",
+    "send": "Enviar",
+    "thinking": "La IA está pensando...",
+    "welcome": "¿Cómo puedo ayudarte hoy?"
+  },
+  "terminal": {
+    "welcome": "Bienvenido a la Terminal SuperCoder",
+    "placeholder": "Escribe un comando..."
+  },
+  "settings": {
+    "title": "Configuración",
+    "language": "Idioma",
+    "theme": "Tema",
+    "notifications": "Notificaciones"
+  }
+}

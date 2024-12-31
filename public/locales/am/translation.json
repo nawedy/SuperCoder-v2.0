@@ -1,0 +1,33 @@
+{
+  "common": {
+    "loading": "በመጫን ላይ...",
+    "error": "ስህተት ተከስቷል",
+    "save": "አስቀምጥ",
+    "cancel": "ሰርዝ",
+    "send": "ላክ",
+    "search": "ፈልግ"
+  },
+  "auth": {
+    "signIn": "ግባ",
+    "signUp": "ተመዝገብ",
+    "signOut": "ውጣ",
+    "email": "ኢሜይል",
+    "password": "የይለፍ ቃል"
+  },
+  "chat": {
+    "placeholder": "መልእክትዎን ይጻፉ...",
+    "send": "ላክ",
+    "thinking": "ሰው ሰራሽ አእምሮ እያሰበ ነው...",
+    "welcome": "ዛሬ እንዴት ልረዳዎት እችላለሁ?"
+  },
+  "terminal": {
+    "welcome": "እንኳን ደህና መጡ ወደ ሱፐር ኮደር ተርሚናል",
+    "placeholder": "ትእዛዝ ይጻፉ..."
+  },
+  "settings": {
+    "title": "ቅንብሮች",
+    "language": "ቋንቋ",
+    "theme": "ገጽታ",
+    "notifications": "ማሳወቂያዎች"
+  }
+}
