@@ -1,0 +1,29 @@
+flowchart LR
+    A[Application Layer] --> B{Service Router}
+    
+    B --> C[Authentication]
+    C --> D[Cloud IAM]
+    C --> E[Identity Platform]
+    
+    B --> F[Data Processing]
+    F --> G[Cloud Functions]
+    F --> H[Cloud Run]
+    
+    B --> I[Storage]
+    I --> J[Cloud Storage]
+    I --> K[Cloud SQL]
+    
+    B --> L[Security]
+    L --> M[Cloud KMS]
+    L --> N[Secret Manager]
+    L --> O[Cloud DLP]
+    
+    B --> P[Monitoring]
+    P --> Q[Cloud Monitoring]
+    P --> R[Cloud Logging]
+    P --> S[Error Reporting]
+    
+    style A fill:#00C1B5,color:white
+    style B fill:#0A2540,color:white
+    style L fill:#00C1B5,color:white
+    style P fill:#0A2540,color:white

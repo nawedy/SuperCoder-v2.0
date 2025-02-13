@@ -1,0 +1,45 @@
+stateDiagram-v2
+    [*] --> CodeSubmission
+    
+    CodeSubmission --> SecurityScan
+    
+    state SecurityScan {
+        [*] --> StaticAnalysis
+        StaticAnalysis --> DependencyScan
+        DependencyScan --> VulnerabilityScan
+        VulnerabilityScan --> [*]
+    }
+    
+    SecurityScan --> Testing
+    
+    state Testing {
+        [*] --> UnitTests
+        UnitTests --> IntegrationTests
+        IntegrationTests --> SecurityTests
+        SecurityTests --> PerformanceTests
+        PerformanceTests --> [*]
+    }
+    
+    Testing --> Staging
+    
+    state Staging {
+        [*] --> ConfigValidation
+        ConfigValidation --> LoadTesting
+        LoadTesting --> SecurityValidation
+        SecurityValidation --> [*]
+    }
+    
+    Staging --> Production
+    Production --> Monitoring
+    
+    state Monitoring {
+        [*] --> PerformanceMetrics
+        [*] --> SecurityMetrics
+        [*] --> ErrorMetrics
+        PerformanceMetrics --> Alerting
+        SecurityMetrics --> Alerting
+        ErrorMetrics --> Alerting
+        Alerting --> [*]
+    }
+    
+    Monitoring --> [*]

@@ -1,0 +1,36 @@
+flowchart TD
+    A[Client Data] --> B{Data Type Check}
+    B -->|Structured| C[Schema Validation]
+    B -->|Unstructured| D[Raw Data Handler]
+    
+    C --> E[Data Preprocessing]
+    D --> E
+    
+    E --> F{Encryption Level}
+    F -->|Standard| G[AES-256 Encryption]
+    F -->|Enhanced| H[Double Encryption]
+    
+    G --> I[Client-Side Key Generation]
+    H --> I
+    
+    I --> J{Key Management}
+    J --> K[Master Key - KMS]
+    J --> L[Data Key Generation]
+    
+    K --> M[Key Encryption]
+    L --> M
+    
+    M --> N[Encrypted Data Package]
+    N --> O[Metadata Generation]
+    
+    O --> P{Package Verification}
+    P -->|Valid| Q[Ready for Transport]
+    P -->|Invalid| R[Error Handler]
+    
+    R --> S[Retry Logic]
+    S --> E
+    
+    style A fill:#00C1B5,color:white
+    style F fill:#0A2540,color:white
+    style N fill:#00C1B5,color:white
+    style Q fill:#0A2540,color:white

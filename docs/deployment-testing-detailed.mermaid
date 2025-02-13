@@ -1,0 +1,32 @@
+flowchart TD
+    A[Validated Model] --> B[MLflow Model Registry]
+    B --> C{Deployment Stage}
+    
+    C -->|Staging| D[Staging Deployment]
+    C -->|Production| E[Production Deployment]
+    
+    D --> F[Staging Validation]
+    F --> G{Validation Results}
+    
+    G -->|Pass| H[A/B Test Setup]
+    G -->|Fail| I[Rollback Process]
+    
+    H --> J[Traffic Split Configuration]
+    J --> K[Monitoring Setup]
+    
+    K --> L{Performance Comparison}
+    L -->|Better| M[Gradual Rollout]
+    L -->|Worse| N[Rollback]
+    
+    M --> O[Full Deployment]
+    N --> P[Previous Version]
+    
+    O --> Q[Performance Monitoring]
+    P --> Q
+    
+    Q --> R[Long-term Metrics]
+    
+    style A fill:#00C1B5,color:white
+    style C fill:#0A2540,color:white
+    style H fill:#00C1B5,color:white
+    style R fill:#0A2540,color:white

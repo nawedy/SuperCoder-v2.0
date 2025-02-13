@@ -1,0 +1,30 @@
+flowchart LR
+    A[System Events] --> B[Cloud Monitoring]
+    C[User Activities] --> B
+    D[Model Operations] --> B
+    
+    B --> E{Anomaly Detection}
+    E -->|Alert| F[Security Command Center]
+    
+    F --> G{Threat Level}
+    G -->|High| H[Immediate Response]
+    G -->|Medium| I[Investigation Queue]
+    G -->|Low| J[Monitoring Queue]
+    
+    H --> K[Incident Response]
+    I --> K
+    J --> L[Cloud Logging]
+    
+    K --> M{Resolution Steps}
+    M -->|Block| N[Block Access]
+    M -->|Isolate| O[Isolate System]
+    M -->|Update| P[Security Update]
+    
+    N --> Q[Update IAM Rules]
+    O --> Q
+    P --> Q
+    
+    style A fill:#00C1B5,color:white
+    style B fill:#0A2540,color:white
+    style F fill:#00C1B5,color:white
+    style K fill:#0A2540,color:white

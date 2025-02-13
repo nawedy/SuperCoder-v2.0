@@ -1,0 +1,36 @@
+flowchart TD
+    A[Support Request] --> B{Request Type}
+    B -->|Technical| C[Technical Support]
+    B -->|Account| D[Account Support]
+    B -->|Billing| E[Billing Support]
+    B -->|Security| F[Security Support]
+    
+    C --> G[Tech Assessment]
+    G -->|L1| H[Basic Support]
+    G -->|L2| I[Advanced Support]
+    G -->|L3| J[Expert Support]
+    
+    D --> K[Account Review]
+    E --> L[Billing Review]
+    F --> M[Security Review]
+    
+    H --> N{Resolution Check}
+    I --> N
+    J --> N
+    K --> N
+    L --> N
+    M --> N
+    
+    N -->|Resolved| O[Close Ticket]
+    N -->|Unresolved| P[Escalation]
+    P --> Q[Specialist Review]
+    Q --> R[Solution Implementation]
+    R --> N
+    
+    O --> S[Satisfaction Survey]
+    S --> T[Analytics]
+    
+    style A fill:#00C1B5,color:white
+    style B fill:#0A2540,color:white
+    style N fill:#00C1B5,color:white
+    style T fill:#0A2540,color:white

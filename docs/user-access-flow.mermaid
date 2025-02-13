@@ -1,0 +1,32 @@
+stateDiagram-v2
+    [*] --> UserRegistration
+    UserRegistration --> EmailVerification
+    EmailVerification --> InitialAccess
+    
+    InitialAccess --> SetupMFA
+    SetupMFA --> AccessGranted
+    
+    AccessGranted --> RoleAssignment
+    
+    state RoleAssignment {
+        [*] --> BasicAccess
+        BasicAccess --> TeamAccess: Team Invite
+        TeamAccess --> AdminAccess: Admin Promotion
+        AdminAccess --> [*]
+    }
+    
+    RoleAssignment --> AccessControl
+    
+    state AccessControl {
+        [*] --> TokenGeneration
+        TokenGeneration --> PermissionCheck
+        PermissionCheck --> ResourceAccess
+        ResourceAccess --> [*]
+    }
+    
+    AccessControl --> ActiveSession
+    ActiveSession --> SessionExpiry
+    SessionExpiry --> TokenRefresh
+    TokenRefresh --> ActiveSession
+    
+    ActiveSession --> [*]

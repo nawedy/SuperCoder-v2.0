@@ -1,0 +1,32 @@
+flowchart TD
+    A[Test Initialization] --> B{Test Type}
+    B -->|Unit| C[Unit Testing]
+    B -->|Integration| D[Integration Testing]
+    B -->|Security| E[Security Testing]
+    B -->|Performance| F[Performance Testing]
+    
+    C --> G[Mock Services]
+    D --> H[Test Environment]
+    E --> I[Security Scan]
+    F --> J[Load Testing]
+    
+    G --> K{Validation}
+    H --> K
+    I --> K
+    J --> K
+    
+    K -->|Pass| L[Test Report]
+    K -->|Fail| M[Debug Analysis]
+    
+    M --> N[Issue Tracking]
+    N --> O[Fix Implementation]
+    O --> P[Regression Testing]
+    P --> K
+    
+    L --> Q[Deploy Gate]
+    Q --> R[Production Release]
+    
+    style A fill:#00C1B5,color:white
+    style K fill:#0A2540,color:white
+    style Q fill:#00C1B5,color:white
+    style R fill:#0A2540,color:white

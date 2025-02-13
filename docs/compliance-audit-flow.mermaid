@@ -1,0 +1,37 @@
+stateDiagram-v2
+    [*] --> DataIngestion
+    
+    state DataIngestion {
+        [*] --> APILogs
+        [*] --> UserActions
+        [*] --> SystemEvents
+        APILogs --> LogAggregation
+        UserActions --> LogAggregation
+        SystemEvents --> LogAggregation
+        LogAggregation --> [*]
+    }
+    
+    DataIngestion --> ComplianceCheck
+    
+    state ComplianceCheck {
+        [*] --> GDPRRules
+        [*] --> HIPAARules
+        [*] --> SOC2Rules
+        GDPRRules --> ComplianceEngine
+        HIPAARules --> ComplianceEngine
+        SOC2Rules --> ComplianceEngine
+        ComplianceEngine --> [*]
+    }
+    
+    ComplianceCheck --> AuditProcessing
+    
+    state AuditProcessing {
+        [*] --> RealTimeAudits
+        [*] --> ScheduledAudits
+        RealTimeAudits --> AuditReports
+        ScheduledAudits --> AuditReports
+        AuditReports --> [*]
+    }
+    
+    AuditProcessing --> ReportGeneration
+    ReportGeneration --> [*]

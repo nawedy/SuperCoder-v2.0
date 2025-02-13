@@ -1,0 +1,40 @@
+stateDiagram-v2
+    [*] --> InitialSubmission
+    InitialSubmission --> SourceValidation
+    
+    state SourceValidation {
+        [*] --> CodeAnalysis
+        CodeAnalysis --> DependencyCheck
+        DependencyCheck --> OriginVerification
+        OriginVerification --> [*]
+    }
+    
+    SourceValidation --> SecurityScanning
+    
+    state SecurityScanning {
+        [*] --> StaticAnalysis
+        StaticAnalysis --> DynamicAnalysis
+        DynamicAnalysis --> BehaviorAnalysis
+        BehaviorAnalysis --> [*]
+    }
+    
+    SecurityScanning --> EnclavePrep
+    
+    state EnclavePrep {
+        [*] --> ResourceAllocation
+        ResourceAllocation --> SecurityConfig
+        SecurityConfig --> HSMBinding
+        HSMBinding --> [*]
+    }
+    
+    EnclavePrep --> Deployment
+    Deployment --> ActiveMonitoring
+    
+    state ActiveMonitoring {
+        [*] --> PerformanceWatch
+        PerformanceWatch --> SecurityWatch
+        SecurityWatch --> ComplianceWatch
+        ComplianceWatch --> [*]
+    }
+    
+    ActiveMonitoring --> [*]

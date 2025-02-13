@@ -1,0 +1,36 @@
+flowchart TD
+    A[Raw Code Data] --> B{Initial Validation}
+    B -->|Valid| C[Data Quality Analysis]
+    B -->|Invalid| D[Error Logging]
+    
+    C --> E{Quality Checks}
+    E -->|Duplicate Check| F[Deduplication]
+    E -->|Quality Score| G[Quality Filter]
+    E -->|Format Check| H[Format Validation]
+    
+    F --> I[Data Cleaning]
+    G --> I
+    H --> I
+    
+    I --> J[Tokenization Process]
+    J --> K{Tokenizer Selection}
+    K -->|Code| L[Code Tokenizer]
+    K -->|Text| M[Text Tokenizer]
+    
+    L --> N[Token Processing]
+    M --> N
+    
+    N --> O[Dataset Split]
+    O --> P{Split Configuration}
+    P -->|Training| Q[Train Set]
+    P -->|Validation| R[Val Set]
+    P -->|Testing| S[Test Set]
+    
+    Q --> T[Dataset Verification]
+    R --> T
+    S --> T
+    
+    style A fill:#00C1B5,color:white
+    style E fill:#0A2540,color:white
+    style J fill:#00C1B5,color:white
+    style T fill:#0A2540,color:white

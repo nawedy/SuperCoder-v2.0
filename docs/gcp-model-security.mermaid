@@ -1,0 +1,32 @@
+stateDiagram-v2
+    [*] --> ModelRegistration
+    ModelRegistration --> SecurityValidation: New Model
+    
+    SecurityValidation --> ValidationFailed: Failed Checks
+    ValidationFailed --> ModelRegistration: Return for Update
+    
+    SecurityValidation --> PrivacyCheck: Passed
+    PrivacyCheck --> ContainerDeployment: Passed
+    PrivacyCheck --> PrivacyFailed: Failed
+    
+    ContainerDeployment --> CloudKMS
+    CloudKMS --> ModelEncryption
+    
+    ModelEncryption --> DeploymentReady
+    
+    DeploymentReady --> ActiveModel
+    ActiveModel --> [*]
+    
+    state SecurityValidation {
+        [*] --> SourceCheck
+        SourceCheck --> BinaryAuthorization
+        BinaryAuthorization --> VulnerabilityScanning
+        VulnerabilityScanning --> [*]
+    }
+    
+    state PrivacyCheck {
+        [*] --> DataFlowAnalysis
+        DataFlowAnalysis --> CloudDLP
+        CloudDLP --> ComplianceValidation
+        ComplianceValidation --> [*]
+    }

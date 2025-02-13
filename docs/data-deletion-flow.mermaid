@@ -1,0 +1,39 @@
+flowchart TD
+    A[Deletion Request] --> B{Request Validation}
+    B -->|Valid| C[Locate Data]
+    B -->|Invalid| D[Error Response]
+    
+    C --> E[Data Identification]
+    E --> F[Metadata Collection]
+    
+    F --> G{Storage Type}
+    G -->|Memory| H[Memory Wiping]
+    G -->|Disk| I[Secure Erase]
+    G -->|Distributed| J[Distributed Cleanup]
+    
+    H --> K[Verification]
+    I --> K
+    J --> K
+    
+    K --> L{Verify Complete}
+    L -->|Success| M[Generate Proof]
+    L -->|Fail| N[Retry Process]
+    
+    M --> O[Proof Components]
+    O --> P[Hash Generation]
+    P --> Q[Timestamp Service]
+    
+    Q --> R[Build Certificate]
+    R --> S[Sign Certificate]
+    
+    S --> T[Store Proof]
+    T --> U[Client Notification]
+    
+    N --> V[Error Analysis]
+    V --> W[Adjustment]
+    W --> C
+    
+    style A fill:#00C1B5,color:white
+    style G fill:#0A2540,color:white
+    style O fill:#00C1B5,color:white
+    style U fill:#0A2540,color:white

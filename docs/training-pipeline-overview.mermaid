@@ -1,0 +1,36 @@
+flowchart TD
+    A[Raw Code Data] --> B[Data Processing]
+    B --> C[Model Training]
+    C --> D[Validation & Testing]
+    D --> E[Deployment]
+    
+    subgraph Data Processing
+    B1[Quality Checks]
+    B2[Data Cleaning]
+    B3[Tokenization]
+    B4[Dataset Split]
+    end
+    
+    subgraph Model Training
+    C1[Training Setup]
+    C2[Distributed Training]
+    C3[Checkpointing]
+    end
+    
+    subgraph Validation & Testing
+    D1[Model Evaluation]
+    D2[Performance Metrics]
+    D3[Acceptance Criteria]
+    end
+    
+    subgraph Deployment
+    E1[Model Registry]
+    E2[Endpoint Update]
+    E3[A/B Testing]
+    end
+    
+    style A fill:#00C1B5,color:white
+    style B fill:#0A2540,color:white
+    style C fill:#00C1B5,color:white
+    style D fill:#0A2540,color:white
+    style E fill:#00C1B5,color:white

@@ -1,0 +1,28 @@
+flowchart TD
+    A[User Input] --> B{Input Classification}
+    B -->|Structured Data| C[Schema Validation]
+    B -->|Unstructured Text| D[NLP Analysis]
+    B -->|Mixed Content| E[Hybrid Processing]
+    
+    C --> F[PII Scanner]
+    D --> F
+    E --> F
+    
+    F --> G{PII Detection}
+    G -->|Found| H[Data Transformation]
+    G -->|None| I[Clean Data]
+    
+    H --> J[Apply Privacy Rules]
+    J --> K[Tokenization]
+    K --> L[Data Reconstruction]
+    
+    I --> M[Verification Check]
+    L --> M
+    
+    M --> N[Privacy Log]
+    N --> O[Forward to Model]
+    
+    style A fill:#00C1B5,color:white
+    style F fill:#0A2540,color:white
+    style J fill:#00C1B5,color:white
+    style O fill:#0A2540,color:white

@@ -1,0 +1,48 @@
+flowchart TD
+    A[Error Detected] --> B{Error Classification}
+    B -->|Authentication| C[Auth Errors]
+    B -->|System| D[System Errors]
+    B -->|Resource| E[Resource Errors]
+    B -->|Network| F[Network Errors]
+    
+    C --> G{Auth Error Type}
+    G -->|Invalid Token| H[Token Refresh]
+    G -->|Expired Session| I[Session Renewal]
+    G -->|Invalid Permissions| J[Permission Error]
+    
+    D --> K{System Error Type}
+    K -->|Service Down| L[Failover Process]
+    K -->|Capacity| M[Scale Resources]
+    K -->|Internal| N[System Recovery]
+    
+    E --> O{Resource Error}
+    O -->|Not Found| P[Resource Check]
+    O -->|Quota| Q[Quota Management]
+    O -->|Access Denied| R[Access Review]
+    
+    F --> S{Network Error}
+    S -->|Timeout| T[Retry Logic]
+    S -->|Connection| U[Connection Recovery]
+    S -->|DNS| V[DNS Resolution]
+    
+    H --> W[Error Resolution]
+    I --> W
+    J --> W
+    L --> W
+    M --> W
+    N --> W
+    P --> W
+    Q --> W
+    R --> W
+    T --> W
+    U --> W
+    V --> W
+    
+    W --> X[User Notification]
+    X --> Y[Error Logging]
+    Y --> Z[Analytics Update]
+    
+    style A fill:#00C1B5,color:white
+    style B fill:#0A2540,color:white
+    style W fill:#00C1B5,color:white
+    style Z fill:#0A2540,color:white

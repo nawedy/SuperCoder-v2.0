@@ -1,0 +1,34 @@
+flowchart TD
+    A[User Authentication Request] --> B{Authentication Type}
+    B -->|OAuth2| C[Google OAuth2]
+    B -->|JWT| D[Custom JWT]
+    B -->|API Key| E[API Authentication]
+    
+    C --> F[Identity Platform]
+    D --> F
+    E --> F
+    
+    F --> G{Token Validation}
+    G -->|Valid| H[Session Management]
+    G -->|Invalid| I[Authentication Error]
+    
+    H --> J[Create Session]
+    J --> K[Generate Access Token]
+    K --> L[Create Refresh Token]
+    
+    L --> M{Access Level Check}
+    M -->|Basic| N[Basic Resources]
+    M -->|Premium| O[Premium Resources]
+    M -->|Admin| P[Admin Resources]
+    
+    N --> Q[Resource Access]
+    O --> Q
+    P --> Q
+    
+    Q --> R[Access Logging]
+    R --> S[Analytics]
+    
+    style A fill:#00C1B5,color:white
+    style F fill:#0A2540,color:white
+    style K fill:#00C1B5,color:white
+    style Q fill:#0A2540,color:white

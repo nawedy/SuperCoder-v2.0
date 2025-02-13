@@ -1,0 +1,37 @@
+flowchart TD
+    A[Trained Model] --> B{Validation Process}
+    B -->|CodeBLEU| C[Code Quality Metrics]
+    B -->|CodeXGLUE| D[Benchmark Tests]
+    
+    C --> E[Syntax Analysis]
+    C --> F[Semantic Analysis]
+    C --> G[AST Analysis]
+    
+    D --> H[Task Performance]
+    D --> I[Code Generation]
+    D --> J[Code Understanding]
+    
+    E --> K[Quality Score]
+    F --> K
+    G --> K
+    
+    H --> L[Benchmark Score]
+    I --> L
+    J --> L
+    
+    K --> M{Acceptance Check}
+    L --> M
+    
+    M -->|Pass| N[Validation Report]
+    M -->|Fail| O[Failure Analysis]
+    
+    O --> P[Issue Identification]
+    P --> Q[Improvement Suggestions]
+    Q --> R[Feedback Loop]
+    
+    N --> S[Final Validation]
+    
+    style A fill:#00C1B5,color:white
+    style B fill:#0A2540,color:white
+    style M fill:#00C1B5,color:white
+    style S fill:#0A2540,color:white

@@ -1,0 +1,33 @@
+flowchart TD
+    A[User Request] --> B{Authentication Layer}
+    B -->|Failed| C[Return Error]
+    B -->|Passed| D[Azure AD B2C]
+    D --> E{Security Checks}
+    
+    E -->|Failed| F[Security Alert]
+    F --> G[Log Incident]
+    
+    E -->|Passed| H[Privacy Engine]
+    H --> I[PII Detection]
+    I --> J{PII Found?}
+    
+    J -->|Yes| K[Data Anonymization]
+    K --> L[Secure Model Interface]
+    
+    J -->|No| L
+    
+    L --> M[Model Registry]
+    M --> N{Model Security Check}
+    
+    N -->|Failed| O[Block Request]
+    O --> P[Log Security Event]
+    
+    N -->|Passed| Q[Process Request]
+    Q --> R[Encrypt Response]
+    R --> S[Return to User]
+    
+    style A fill:#00C1B5,color:white
+    style B fill:#0A2540,color:white
+    style H fill:#00C1B5,color:white
+    style L fill:#0A2540,color:white
+    style M fill:#00C1B5,color:white
