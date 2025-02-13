@@ -1,101 +1,151 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
-import { SecurityConfig } from '../config/security-config';
+import { SecurityScanner } from '../security/security-scanner';
 import { EncryptionService } from '../security/encryption-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
 import { Storage } from '@google-cloud/storage';
+import { BigQuery } from '@google-cloud/bigquery';
 
 interface ModelMetadata {
-    id: string;
     name: string;
     version: string;
-    timestamp: Date;
-    author: string;
-    framework: string;
-    type: 'code-completion' | 'code-generation' | 'code-analysis';
-    performanceMetrics: {
-        accuracy: number;
-        latency: number;
-        throughput: number;
-    };
-    securityScans: {
-        timestamp: Date;
-        score: number;
-        vulnerabilities: string[];
+    type: string;
+    framework?: string;
+    metrics: Record<string, number>;
+    artifacts?: {
+        path: string;
+        type: string;
+        size: number;
+        hash: string;
     }[];
-    deploymentStatus: 'draft' | 'testing' | 'production' | 'deprecated';
-    tags: string[];
+    dependencies?: {
+        name: string;
+        version: string;
+    }[];
+    training?: {
+        startTime: Date;
+        endTime: Date;
+        parameters: Record<string, any>;
+        datasetId: string;
+    };
+    validation?: {
+        accuracy: number;
+        loss: number;
+        metrics: Record<string, number>;
+    };
+    deployment?: {
+        environment: string;
+        status: 'active' | 'inactive';
+        instances: number;
+    };
 }
 
-interface RegistryStats {
-    totalModels: number;
-    activeModels: number;
-    totalVersions: number;
-    storageUsage: number;
+interface ModelVersion {
+    modelId: string;
+    version: string;
+    metadata: ModelMetadata;
+    data: Buffer;
+    createdAt: Date;
+    updatedAt: Date;
+    status: 'draft' | 'validated' | 'deployed' | 'archived';
+    security: {
+        scanned: boolean;
+        vulnerabilities: any[];
+        score: number;
+    };
 }
 
 export class ModelRegistryService {
     private monitor: MonitoringService;
-    private securityConfig: SecurityConfig;
+    private security: SecurityScanner;
     private encryption: EncryptionService;
-    private auditService: AuditTrailService;
+    private audit: AuditTrailService;
     private storage: Storage;
-    private models: Map<string, ModelMetadata>;
+    private bigquery: BigQuery;
+    private readonly bucketName: string;
+    private readonly datasetId: string;
 
     constructor(
         monitor: MonitoringService,
-        securityConfig: SecurityConfig,
+        security: SecurityScanner,
         encryption: EncryptionService,
-        auditService: AuditTrailService
+        audit: AuditTrailService,
+        projectId: string
     ) {
         this.monitor = monitor;
-        this.securityConfig = securityConfig;
+        this.security = security;
         this.encryption = encryption;
-        this.auditService = auditService;
-        this.storage = new Storage();
-        this.models = new Map();
+        this.audit = audit;
+        this.storage = new Storage({ projectId });
+        this.bigquery = new BigQuery({ projectId });
+        this.bucketName = `${projectId}-model-registry`;
+        this.datasetId = 'model_registry';
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
-        await this.setupStorage();
-        await this.loadExistingModels();
+        await this.ensureInfrastructure();
     }
 
     async registerModel(
         modelData: Buffer,
-        metadata: Omit<ModelMetadata, 'id' | 'timestamp' | 'securityScans'>
-    ): Promise<ModelMetadata> {
+        metadata: ModelMetadata
+    ): Promise<string> {
+        const startTime = Date.now();
         try {
-            // Generate model ID and validate metadata
-            const modelId = this.generateModelId(metadata.name, metadata.version);
+            // Generate model ID
+            const modelId = this.generateModelId(metadata.name);
+
+            // Validate metadata
             await this.validateMetadata(metadata);
+
+            // Scan model for security issues
+            const securityScan = await this.security.scanModel(modelData);
+            if (securityScan.score < 0.7) { // 70% security threshold
+                throw new Error('Model failed security scan');
+            }
 
             // Encrypt model data
             const encryptedData = await this.encryption.encrypt(modelData);
 
-            // Store model data
-            await this.storeModelData(modelId, encryptedData);
-
-            // Create metadata
-            const modelMetadata: ModelMetadata = {
-                id: modelId,
-                timestamp: new Date(),
-                securityScans: [],
-                ...metadata
+            // Create model version
+            const version: ModelVersion = {
+                modelId,
+                version: metadata.version,
+                metadata,
+                data: encryptedData,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+                status: 'draft',
+                security: {
+                    scanned: true,
+                    vulnerabilities: securityScan.vulnerabilities,
+                    score: securityScan.score
+                }
             };
 
-            // Store metadata
-            await this.storeModelMetadata(modelMetadata);
-            this.models.set(modelId, modelMetadata);
+            // Store model data
+            await this.storeModelData(modelId, version);
 
-            // Audit trail
-            await this.auditService.logEvent({
-                eventType: 'model.deploy',
+            // Store metadata
+            await this.storeModelMetadata(version);
+
+            await this.monitor.recordMetric({
+                name: 'model_registered',
+                value: Date.now() - startTime,
+                labels: {
+                    model_id: modelId,
+                    version: metadata.version,
+                    type: metadata.type
+                }
+            });
+
+            await this.audit.logEvent({
+                eventType: 'model.train',
                 actor: {
-                    id: metadata.author,
-                    type: 'user',
-                    metadata: { modelId }
+                    id: 'system',
+                    type: 'service',
+                    metadata: {}
                 },
                 resource: {
                     type: 'model',
@@ -108,43 +158,58 @@ export class ModelRegistryService {
                     userAgent: 'system'
                 },
                 status: 'success',
-                details: { metadata: modelMetadata }
-            });
-
-            // Record metrics
-            await this.monitor.recordMetric({
-                name: 'model_registered',
-                value: 1,
-                labels: {
-                    model_id: modelId,
-                    type: metadata.type
+                details: {
+                    version: metadata.version,
+                    security_score: securityScan.score
                 }
             });
 
-            return modelMetadata;
+            return modelId;
+
         } catch (error) {
             await this.handleError('model_registration_error', error);
             throw error;
         }
     }
 
-    async getModel(modelId: string): Promise<{ data: Buffer; metadata: ModelMetadata }> {
+    async getModel(modelId: string, version?: string): Promise<ModelVersion | null> {
         try {
-            const metadata = this.models.get(modelId);
-            if (!metadata) {
-                throw new Error(`Model not found: ${modelId}`);
+            const query = this.bigquery.dataset(this.datasetId).table('models').query(`
+                SELECT *
+                FROM models
+                WHERE model_id = @modelId
+                ${version ? 'AND version = @version' : ''}
+                ORDER BY created_at DESC
+                LIMIT 1
+            `);
+
+            const [rows] = await query.run({
+                params: { modelId, version }
+            });
+
+            if (!rows.length) {
+                return null;
             }
 
-            // Get encrypted data
-            const encryptedData = await this.retrieveModelData(modelId);
+            const modelVersion = this.deserializeModelVersion(rows[0]);
             
-            // Decrypt data
-            const decryptedData = await this.encryption.decrypt(encryptedData);
+            // Get model data from storage
+            const data = await this.getModelData(modelId, modelVersion.version);
+            
+            // Decrypt model data
+            modelVersion.data = await this.encryption.decrypt(data);
 
-            // Record access
-            await this.recordModelAccess(modelId);
+            await this.monitor.recordMetric({
+                name: 'model_retrieved',
+                value: 1,
+                labels: {
+                    model_id: modelId,
+                    version: version || 'latest'
+                }
+            });
 
-            return { data: decryptedData, metadata };
+            return modelVersion;
+
         } catch (error) {
             await this.handleError('model_retrieval_error', error);
             throw error;
@@ -153,122 +218,152 @@ export class ModelRegistryService {
 
     async updateModelStatus(
         modelId: string,
-        status: ModelMetadata['deploymentStatus']
-    ): Promise<ModelMetadata> {
+        version: string,
+        status: ModelVersion['status']
+    ): Promise<void> {
         try {
-            const metadata = this.models.get(modelId);
-            if (!metadata) {
-                throw new Error(`Model not found: ${modelId}`);
-            }
+            await this.bigquery
+                .dataset(this.datasetId)
+                .table('models')
+                .query(`
+                    UPDATE models
+                    SET status = @status,
+                        updated_at = CURRENT_TIMESTAMP()
+                    WHERE model_id = @modelId
+                    AND version = @version
+                `).run({
+                    params: { modelId, version, status }
+                });
 
-            const updatedMetadata: ModelMetadata = {
-                ...metadata,
-                deploymentStatus: status
-            };
-
-            await this.storeModelMetadata(updatedMetadata);
-            this.models.set(modelId, updatedMetadata);
-
-            await this.auditService.logEvent({
-                eventType: 'model.deploy',
-                actor: {
-                    id: 'system',
-                    type: 'service',
-                    metadata: { modelId }
-                },
-                resource: {
-                    type: 'model',
-                    id: modelId,
-                    action: 'update_status'
-                },
-                context: {
-                    location: 'model-registry',
-                    ipAddress: 'internal',
-                    userAgent: 'system'
-                },
-                status: 'success',
-                details: { status }
+            await this.monitor.recordMetric({
+                name: 'model_status_updated',
+                value: 1,
+                labels: {
+                    model_id: modelId,
+                    version,
+                    status
+                }
             });
 
-            return updatedMetadata;
         } catch (error) {
             await this.handleError('model_update_error', error);
             throw error;
         }
     }
 
-    async getRegistryStats(): Promise<RegistryStats> {
+    private async ensureInfrastructure(): Promise<void> {
         try {
-            const stats: RegistryStats = {
-                totalModels: this.models.size,
-                activeModels: Array.from(this.models.values())
-                    .filter(m => m.deploymentStatus === 'production')
-                    .length,
-                totalVersions: Array.from(this.models.values())
-                    .reduce((acc, curr) => acc + (curr.version ? 1 : 0), 0),
-                storageUsage: await this.calculateStorageUsage()
-            };
+            // Ensure storage bucket exists
+            const [bucketExists] = await this.storage
+                .bucket(this.bucketName)
+                .exists();
+            
+            if (!bucketExists) {
+                await this.storage.createBucket(this.bucketName, {
+                    location: 'US',
+                    storageClass: 'STANDARD'
+                });
+            }
 
-            await this.monitor.recordMetric({
-                name: 'registry_stats',
-                value: stats.totalModels,
-                labels: {
-                    active_models: stats.activeModels.toString(),
-                    storage_usage: stats.storageUsage.toString()
-                }
-            });
-
-            return stats;
+            // Ensure BigQuery dataset and table exist
+            const dataset = this.bigquery.dataset(this.datasetId);
+            const [datasetExists] = await dataset.exists();
+            
+            if (!datasetExists) {
+                await dataset.create();
+                await this.createModelTable(dataset);
+            }
         } catch (error) {
-            await this.handleError('registry_stats_error', error);
+            console.error('Failed to initialize registry infrastructure:', error);
             throw error;
         }
     }
 
-    private async setupStorage(): Promise<void> {
-        // Implementation for setting up storage buckets and folders
+    private async createModelTable(dataset: any): Promise<void> {
+        const schema = {
+            fields: [
+                { name: 'model_id', type: 'STRING' },
+                { name: 'version', type: 'STRING' },
+                { name: 'metadata', type: 'JSON' },
+                { name: 'status', type: 'STRING' },
+                { name: 'security', type: 'JSON' },
+                { name: 'created_at', type: 'TIMESTAMP' },
+                { name: 'updated_at', type: 'TIMESTAMP' }
+            ]
+        };
+
+        await dataset.createTable('models', { schema });
     }
 
-    private async loadExistingModels(): Promise<void> {
-        // Implementation for loading existing models from storage
+    private async storeModelData(
+        modelId: string,
+        version: ModelVersion
+    ): Promise<void> {
+        const filename = `${modelId}/${version.version}/model.bin`;
+        await this.storage
+            .bucket(this.bucketName)
+            .file(filename)
+            .save(version.data);
     }
 
-    private async storeModelData(modelId: string, data: Buffer): Promise<void> {
-        const bucket = this.storage.bucket(this.securityConfig.storage.bucketName);
-        const file = bucket.file(`models/${modelId}`);
-        await file.save(data);
-    }
-
-    private async retrieveModelData(modelId: string): Promise<Buffer> {
-        const bucket = this.storage.bucket(this.securityConfig.storage.bucketName);
-        const file = bucket.file(`models/${modelId}`);
-        const [data] = await file.download();
+    private async getModelData(
+        modelId: string,
+        version: string
+    ): Promise<Buffer> {
+        const filename = `${modelId}/${version}/model.bin`;
+        const [data] = await this.storage
+            .bucket(this.bucketName)
+            .file(filename)
+            .download();
+        
         return data;
     }
 
-    private async storeModelMetadata(metadata: ModelMetadata): Promise<void> {
-        const bucket = this.storage.bucket(this.securityConfig.storage.bucketName);
-        const file = bucket.file(`metadata/${metadata.id}.json`);
-        await file.save(JSON.stringify(metadata));
+    private async storeModelMetadata(version: ModelVersion): Promise<void> {
+        await this.bigquery
+            .dataset(this.datasetId)
+            .table('models')
+            .insert([{
+                model_id: version.modelId,
+                version: version.version,
+                metadata: JSON.stringify(version.metadata),
+                status: version.status,
+                security: JSON.stringify(version.security),
+                created_at: version.createdAt,
+                updated_at: version.updatedAt
+            }]);
     }
 
-    private async validateMetadata(metadata: Partial<ModelMetadata>): Promise<void> {
+    private deserializeModelVersion(row: any): ModelVersion {
+        return {
+            modelId: row.model_id,
+            version: row.version,
+            metadata: JSON.parse(row.metadata),
+            data: Buffer.from([]), // Will be loaded separately
+            createdAt: new Date(row.created_at),
+            updatedAt: new Date(row.updated_at),
+            status: row.status,
+            security: JSON.parse(row.security)
+        };
+    }
+
+    private async validateMetadata(metadata: ModelMetadata): Promise<void> {
         if (!metadata.name || !metadata.version || !metadata.type) {
-            throw new Error('Invalid model metadata');
+            throw new Error('Missing required metadata fields');
+        }
+
+        if (metadata.version && !this.isValidVersion(metadata.version)) {
+            throw new Error('Invalid version format');
         }
     }
 
-    private async recordModelAccess(modelId: string): Promise<void> {
-        await this.monitor.recordMetric({
-            name: 'model_access',
-            value: 1,
-            labels: { model_id: modelId }
-        });
+    private isValidVersion(version: string): boolean {
+        return /^\d+\.\d+\.\d+$/.test(version);
     }
 
-    private async calculateStorageUsage(): Promise<number> {
-        // Implementation for calculating storage usage
-        return 0;
+    private generateModelId(name: string): string {
+        const sanitizedName = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+        return `${sanitizedName}-${Date.now()}`;
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
@@ -277,10 +372,5 @@ export class ModelRegistryService {
             value: 1,
             labels: { error: error.message }
         });
-    }
-
-    private generateModelId(name: string, version: string): string {
-        const sanitizedName = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
-        return `${sanitizedName}-${version}-${Date.now()}`;
     }
 }

@@ -1,52 +1,68 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
+import { AuditTrailService } from '../audit/audit-trail-service';
 import { SecurityConfig } from '../config/security-config';
-import { KMS } from '@google-cloud/kms';
+import { KeyManagementServiceClient } from '@google-cloud/kms';
 import * as crypto from 'crypto';
 
 interface EncryptionKey {
     id: string;
     version: number;
     algorithm: string;
-    createdAt: Date;
-    rotatedAt?: Date;
     status: 'active' | 'rotating' | 'deprecated';
+    createdAt: Date;
+    expiresAt?: Date;
+    metadata: {
+        keyRing: string;
+        location: string;
+        purpose: string;
+    };
 }
 
-interface EncryptedData {
+interface EncryptionResult {
     data: Buffer;
     keyId: string;
-    iv: Buffer;
-    authTag: Buffer;
     algorithm: string;
+    iv: Buffer;
+    tag?: Buffer;
+    metadata: {
+        timestamp: Date;
+        keyVersion: number;
+    };
 }
 
 export class EncryptionService {
     private monitor: MonitoringService;
-    private securityConfig: SecurityConfig;
-    private kms: KMS;
-    private keys: Map<string, EncryptionKey>;
+    private audit: AuditTrailService;
+    private config: SecurityConfig;
+    private kms: KeyManagementServiceClient;
+    private activeKeys: Map<string, EncryptionKey>;
+    private readonly ENCRYPTION_ALGORITHM = 'aes-256-gcm';
     private readonly KEY_ROTATION_INTERVAL = 30 * 24 * 60 * 60 * 1000; // 30 days
 
     constructor(
         monitor: MonitoringService,
-        securityConfig: SecurityConfig
+        audit: AuditTrailService,
+        config: SecurityConfig,
+        projectId: string
     ) {
         this.monitor = monitor;
-        this.securityConfig = securityConfig;
-        this.kms = new KMS();
-        this.keys = new Map();
+        this.audit = audit;
+        this.config = config;
+        this.kms = new KeyManagementServiceClient();
+        this.activeKeys = new Map();
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
-        await this.setupKeys();
+        await this.initializeKeys();
         this.startKeyRotation();
     }
 
-    async encrypt(data: Buffer): Promise<EncryptedData> {
+    async encrypt(data: Buffer): Promise<EncryptionResult> {
+        const startTime = Date.now();
         try {
-            // Get active encryption key
+            // Get active key
             const key = await this.getActiveKey();
 
             // Generate IV
@@ -54,10 +70,9 @@ export class EncryptionService {
 
             // Create cipher
             const cipher = crypto.createCipheriv(
-                this.securityConfig.encryption.algorithm,
+                this.ENCRYPTION_ALGORITHM,
                 await this.getKeyMaterial(key),
-                iv,
-                { authTagLength: 16 }
+                iv
             );
 
             // Encrypt data
@@ -66,174 +81,206 @@ export class EncryptionService {
                 cipher.final()
             ]);
 
-            const authTag = cipher.getAuthTag();
+            // Get auth tag
+            const tag = (cipher as any).getAuthTag();
 
-            // Create encrypted data object
-            const encryptedData: EncryptedData = {
+            const result: EncryptionResult = {
                 data: encrypted,
                 keyId: key.id,
+                algorithm: this.ENCRYPTION_ALGORITHM,
                 iv,
-                authTag,
-                algorithm: this.securityConfig.encryption.algorithm
+                tag,
+                metadata: {
+                    timestamp: new Date(),
+                    keyVersion: key.version
+                }
             };
 
             await this.monitor.recordMetric({
                 name: 'encryption_operation',
-                value: 1,
+                value: Date.now() - startTime,
                 labels: {
+                    operation: 'encrypt',
                     key_id: key.id,
-                    algorithm: key.algorithm
+                    algorithm: this.ENCRYPTION_ALGORITHM
                 }
             });
 
-            return encryptedData;
+            return result;
+
         } catch (error) {
             await this.handleError('encryption_error', error);
             throw error;
         }
     }
 
-    async decrypt(encryptedData: EncryptedData): Promise<Buffer> {
+    async decrypt(
+        encryptedData: Buffer,
+        keyId: string,
+        iv: Buffer,
+        tag?: Buffer
+    ): Promise<Buffer> {
+        const startTime = Date.now();
         try {
             // Get encryption key
-            const key = await this.getKey(encryptedData.keyId);
+            const key = await this.getKey(keyId);
+            if (!key) {
+                throw new Error(`Key not found: ${keyId}`);
+            }
 
             // Create decipher
             const decipher = crypto.createDecipheriv(
-                encryptedData.algorithm,
+                this.ENCRYPTION_ALGORITHM,
                 await this.getKeyMaterial(key),
-                encryptedData.iv,
-                { authTagLength: 16 }
+                iv
             );
 
-            // Set auth tag
-            decipher.setAuthTag(encryptedData.authTag);
+            // Set auth tag if provided
+            if (tag) {
+                (decipher as any).setAuthTag(tag);
+            }
 
             // Decrypt data
             const decrypted = Buffer.concat([
-                decipher.update(encryptedData.data),
+                decipher.update(encryptedData),
                 decipher.final()
             ]);
 
             await this.monitor.recordMetric({
-                name: 'decryption_operation',
-                value: 1,
+                name: 'encryption_operation',
+                value: Date.now() - startTime,
                 labels: {
+                    operation: 'decrypt',
                     key_id: key.id,
-                    algorithm: key.algorithm
+                    algorithm: this.ENCRYPTION_ALGORITHM
                 }
             });
 
             return decrypted;
+
         } catch (error) {
             await this.handleError('decryption_error', error);
             throw error;
         }
     }
 
-    private async setupKeys(): Promise<void> {
-        // Implementation for setting up encryption keys
-        const key = await this.createNewKey();
-        this.keys.set(key.id, key);
-    }
+    private async initializeKeys(): Promise<void> {
+        try {
+            // List existing keys
+            const [keys] = await this.kms.listCryptoKeys({
+                parent: this.getKeyRingPath()
+            });
 
-    private async createNewKey(): Promise<EncryptionKey> {
-        const keyId = `key-${Date.now()}`;
-        const key: EncryptionKey = {
-            id: keyId,
-            version: 1,
-            algorithm: this.securityConfig.encryption.algorithm,
-            createdAt: new Date(),
-            status: 'active'
-        };
-
-        // Create key in Cloud KMS
-        await this.kms.createCryptoKey({
-            parent: this.securityConfig.encryption.kmsKeyRing,
-            cryptoKeyId: keyId,
-            cryptoKey: {
-                purpose: 'ENCRYPT_DECRYPT',
-                versionTemplate: {
-                    algorithm: 'GOOGLE_SYMMETRIC_ENCRYPTION'
-                },
-                rotationPeriod: {
-                    seconds: this.KEY_ROTATION_INTERVAL / 1000
+            for (const key of keys) {
+                const keyInfo = this.parseKeyInfo(key);
+                if (keyInfo.status === 'active') {
+                    this.activeKeys.set(keyInfo.id, keyInfo);
                 }
             }
-        });
 
-        return key;
+            // Create new key if none exist
+            if (this.activeKeys.size === 0) {
+                await this.createNewKey();
+            }
+
+        } catch (error) {
+            await this.handleError('key_initialization_error', error);
+            throw error;
+        }
     }
 
     private startKeyRotation(): void {
         setInterval(async () => {
-            await this.rotateKeys();
+            try {
+                await this.rotateKeys();
+            } catch (error) {
+                await this.handleError('key_rotation_error', error);
+            }
         }, this.KEY_ROTATION_INTERVAL);
     }
 
     private async rotateKeys(): Promise<void> {
-        try {
-            for (const [keyId, key] of this.keys.entries()) {
-                const age = Date.now() - key.createdAt.getTime();
-                if (age >= this.KEY_ROTATION_INTERVAL && key.status === 'active') {
-                    await this.rotateKey(keyId);
-                }
+        for (const [id, key] of this.activeKeys) {
+            const age = Date.now() - key.createdAt.getTime();
+            if (age > this.KEY_ROTATION_INTERVAL) {
+                await this.rotateKey(key);
             }
-        } catch (error) {
-            await this.handleError('key_rotation_error', error);
         }
     }
 
-    private async rotateKey(keyId: string): Promise<void> {
-        const key = this.keys.get(keyId);
-        if (!key) return;
-
+    private async rotateKey(oldKey: EncryptionKey): Promise<void> {
         try {
             // Create new key version
             const newKey = await this.createNewKey();
-            
-            // Update old key status
-            key.status = 'deprecated';
-            key.rotatedAt = new Date();
-            
-            // Add new key
-            this.keys.set(newKey.id, newKey);
 
-            await this.monitor.recordMetric({
-                name: 'key_rotation',
-                value: 1,
-                labels: { key_id: keyId }
+            // Update key status
+            oldKey.status = 'deprecated';
+            oldKey.expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours grace period
+
+            await this.audit.logEvent({
+                eventType: 'security.alert',
+                actor: {
+                    id: 'system',
+                    type: 'service',
+                    metadata: {}
+                },
+                resource: {
+                    type: 'encryption-key',
+                    id: oldKey.id,
+                    action: 'rotate'
+                },
+                context: {
+                    location: 'encryption-service',
+                    ipAddress: 'internal',
+                    userAgent: 'system'
+                },
+                status: 'success',
+                details: {
+                    old_key_id: oldKey.id,
+                    new_key_id: newKey.id
+                }
             });
+
         } catch (error) {
             await this.handleError('key_rotation_error', error);
             throw error;
         }
     }
 
-    private async getActiveKey(): Promise<EncryptionKey> {
-        const activeKeys = Array.from(this.keys.values())
-            .filter(k => k.status === 'active');
+    private async createNewKey(): Promise<EncryptionKey> {
+        // Implementation for creating new encryption key
+        return {} as EncryptionKey;
+    }
 
-        if (activeKeys.length === 0) {
-            const newKey = await this.createNewKey();
-            this.keys.set(newKey.id, newKey);
-            return newKey;
+    private async getActiveKey(): Promise<EncryptionKey> {
+        // Get the most recently created active key
+        const activeKeys = Array.from(this.activeKeys.values())
+            .filter(key => key.status === 'active')
+            .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+        if (!activeKeys.length) {
+            throw new Error('No active encryption keys available');
         }
 
         return activeKeys[0];
     }
 
-    private async getKey(keyId: string): Promise<EncryptionKey> {
-        const key = this.keys.get(keyId);
-        if (!key) {
-            throw new Error(`Encryption key not found: ${keyId}`);
-        }
-        return key;
+    private async getKey(keyId: string): Promise<EncryptionKey | null> {
+        return this.activeKeys.get(keyId) || null;
     }
 
     private async getKeyMaterial(key: EncryptionKey): Promise<Buffer> {
-        // Implementation for retrieving key material from Cloud KMS
-        return Buffer.from('');
+        // Implementation for getting key material
+        return Buffer.from([]);
+    }
+
+    private getKeyRingPath(): string {
+        return `projects/${this.kms.projectId}/locations/global/keyRings/encryption-keys`;
+    }
+
+    private parseKeyInfo(key: any): EncryptionKey {
+        // Implementation for parsing key info
+        return {} as EncryptionKey;
     }
 
     private async handleError(type: string, error: Error): Promise<void> {

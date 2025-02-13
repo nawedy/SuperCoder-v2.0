@@ -1,209 +1,364 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
-import { SecurityConfig } from '../config/security-config';
-import { Container } from '@google-cloud/container';
-import { CloudRun } from '@google-cloud/run';
-import { KMS } from '@google-cloud/kms';
+import { ModelRegistryService } from '../registry/model-registry-service';
+import { CacheService } from '../cache/cache-service';
+import { AuditTrailService } from '../audit/audit-trail-service';
+import { ResourceManagementService } from '../resources/resource-management-service';
+import { PubSub } from '@google-cloud/pubsub';
+import * as tf from '@tensorflow/tfjs-node';
 
 interface ServingConfig {
     modelId: string;
     version: string;
-    scaling: {
-        minInstances: number;
-        maxInstances: number;
-        targetConcurrency: number;
-    };
-    resources: {
-        cpu: string;
-        memory: string;
-        gpu?: string;
-    };
-    security: {
-        encryptionRequired: boolean;
-        authenticationRequired: boolean;
-        maxRequestSize: number;
+    batchSize: number;
+    maxConcurrentRequests: number;
+    timeout: number;
+    cacheEnabled: boolean;
+    monitoring: {
+        metrics: string[];
+        samplingRate: number;
     };
 }
 
-interface ModelInstance {
+interface InferenceRequest {
     id: string;
-    url: string;
-    status: 'starting' | 'ready' | 'error';
+    modelId: string;
+    input: any;
+    metadata: {
+        userId?: string;
+        timestamp: Date;
+        priority: 'high' | 'medium' | 'low';
+    };
+}
+
+interface InferenceResponse {
+    requestId: string;
+    output: any;
     metrics: {
         latency: number;
-        throughput: number;
-        errorRate: number;
-        lastUpdated: Date;
+        preprocessingTime: number;
+        inferenceTime: number;
+        postprocessingTime: number;
+    };
+    metadata: {
+        modelId: string;
+        version: string;
+        timestamp: Date;
     };
 }
 
 export class ModelServingService {
     private monitor: MonitoringService;
-    private securityConfig: SecurityConfig;
-    private container: Container;
-    private cloudRun: CloudRun;
-    private kms: KMS;
-    private instances: Map<string, ModelInstance>;
+    private registry: ModelRegistryService;
+    private cache: CacheService;
+    private audit: AuditTrailService;
+    private resources: ResourceManagementService;
+    private pubsub: PubSub;
+    private loadedModels: Map<string, tf.GraphModel>;
+    private configs: Map<string, ServingConfig>;
+    private requestQueue: Map<string, Promise<InferenceResponse>>;
+    private readonly DEFAULT_TIMEOUT = 30000; // 30 seconds
 
     constructor(
         monitor: MonitoringService,
-        securityConfig: SecurityConfig
+        registry: ModelRegistryService,
+        cache: CacheService,
+        audit: AuditTrailService,
+        resources: ResourceManagementService,
+        projectId: string
     ) {
         this.monitor = monitor;
-        this.securityConfig = securityConfig;
-        this.container = new Container();
-        this.cloudRun = new CloudRun();
-        this.kms = new KMS();
-        this.instances = new Map();
+        this.registry = registry;
+        this.cache = cache;
+        this.audit = audit;
+        this.resources = resources;
+        this.pubsub = new PubSub({ projectId });
+        this.loadedModels = new Map();
+        this.configs = new Map();
+        this.requestQueue = new Map();
+
+        this.initialize();
     }
 
-    async deployModel(config: ServingConfig): Promise<ModelInstance> {
+    private async initialize(): Promise<void> {
+        await this.setupHealthCheck();
+        this.startMetricsCollection();
+    }
+
+    async deployModel(
+        modelId: string,
+        version: string,
+        config: Partial<ServingConfig>
+    ): Promise<void> {
         try {
-            // Validate configuration
-            await this.validateConfig(config);
+            // Get model from registry
+            const model = await this.registry.getModel(modelId, version);
+            if (!model) {
+                throw new Error(`Model not found: ${modelId}@${version}`);
+            }
 
-            // Create container image
-            const imageUrl = await this.buildModelContainer(config);
-
-            // Deploy to Cloud Run
-            const service = await this.deployToCloudRun(imageUrl, config);
-
-            // Create model instance
-            const instance: ModelInstance = {
-                id: `inst-${Date.now()}`,
-                url: service.url,
-                status: 'starting',
-                metrics: {
-                    latency: 0,
-                    throughput: 0,
-                    errorRate: 0,
-                    lastUpdated: new Date()
+            // Create serving config
+            const servingConfig: ServingConfig = {
+                modelId,
+                version,
+                batchSize: config.batchSize || 32,
+                maxConcurrentRequests: config.maxConcurrentRequests || 100,
+                timeout: config.timeout || this.DEFAULT_TIMEOUT,
+                cacheEnabled: config.cacheEnabled ?? true,
+                monitoring: {
+                    metrics: config.monitoring?.metrics || ['latency', 'throughput', 'errors'],
+                    samplingRate: config.monitoring?.samplingRate || 0.1
                 }
             };
 
-            // Store instance
-            this.instances.set(instance.id, instance);
+            // Load model
+            const tfModel = await tf.loadGraphModel(
+                tf.io.fromMemory(model.data)
+            );
 
-            // Start monitoring
-            await this.startInstanceMonitoring(instance.id);
+            // Store model and config
+            this.loadedModels.set(this.getModelKey(modelId, version), tfModel);
+            this.configs.set(modelId, servingConfig);
 
-            await this.monitor.recordMetric({
-                name: 'model_deployment',
-                value: 1,
-                labels: {
-                    model_id: config.modelId,
-                    instance_id: instance.id
-                }
+            await this.audit.logEvent({
+                eventType: 'model.deploy',
+                actor: {
+                    id: 'system',
+                    type: 'service',
+                    metadata: {}
+                },
+                resource: {
+                    type: 'model',
+                    id: modelId,
+                    action: 'deploy'
+                },
+                context: {
+                    location: 'model-serving',
+                    ipAddress: 'internal',
+                    userAgent: 'system'
+                },
+                status: 'success',
+                details: { version, config: servingConfig }
             });
 
-            return instance;
         } catch (error) {
-            await this.monitor.recordMetric({
-                name: 'deployment_error',
-                value: 1,
-                labels: {
-                    model_id: config.modelId,
-                    error: error.message
-                }
-            });
+            await this.handleError('model_deployment_error', error);
             throw error;
         }
     }
 
-    private async validateConfig(config: ServingConfig): Promise<void> {
-        if (!config.modelId || !config.version) {
-            throw new Error('Invalid serving configuration');
+    async inference(request: InferenceRequest): Promise<InferenceResponse> {
+        const startTime = Date.now();
+        try {
+            // Get config
+            const config = this.configs.get(request.modelId);
+            if (!config) {
+                throw new Error(`Model not deployed: ${request.modelId}`);
+            }
+
+            // Check concurrent requests
+            if (this.requestQueue.size >= config.maxConcurrentRequests) {
+                throw new Error('Server is overloaded');
+            }
+
+            // Check cache
+            if (config.cacheEnabled) {
+                const cached = await this.checkCache(request);
+                if (cached) {
+                    return cached;
+                }
+            }
+
+            // Create promise for this request
+            const promise = this.processRequest(request, config);
+            this.requestQueue.set(request.id, promise);
+
+            // Set timeout
+            const timeoutPromise = new Promise<never>((_, reject) => {
+                setTimeout(() => reject(new Error('Request timeout')), config.timeout);
+            });
+
+            // Wait for result or timeout
+            const response = await Promise.race([promise, timeoutPromise]);
+
+            // Cache result
+            if (config.cacheEnabled) {
+                await this.cacheResponse(request, response);
+            }
+
+            // Record metrics
+            await this.recordMetrics(request, response);
+
+            return response;
+
+        } catch (error) {
+            await this.handleError('inference_error', error);
+            throw error;
+        } finally {
+            this.requestQueue.delete(request.id);
         }
-        // Add more validation logic
     }
 
-    private async buildModelContainer(config: ServingConfig): Promise<string> {
-        // Implementation for container building
-        return `gcr.io/${process.env.PROJECT_ID}/model-${config.modelId}:${config.version}`;
-    }
-
-    private async deployToCloudRun(
-        imageUrl: string,
+    private async processRequest(
+        request: InferenceRequest,
         config: ServingConfig
-    ): Promise<any> {
-        return this.cloudRun.createService({
-            name: `model-${config.modelId}`,
-            image: imageUrl,
-            resources: config.resources,
-            scaling: config.scaling
+    ): Promise<InferenceResponse> {
+        const timings = {
+            preprocess: 0,
+            inference: 0,
+            postprocess: 0
+        };
+
+        try {
+            // Get model
+            const model = this.loadedModels.get(
+                this.getModelKey(config.modelId, config.version)
+            );
+            if (!model) {
+                throw new Error('Model not loaded');
+            }
+
+            // Preprocess
+            const preprocessStart = Date.now();
+            const processedInput = await this.preprocessInput(request.input);
+            timings.preprocess = Date.now() - preprocessStart;
+
+            // Inference
+            const inferenceStart = Date.now();
+            const rawOutput = await model.predict(processedInput);
+            timings.inference = Date.now() - inferenceStart;
+
+            // Postprocess
+            const postprocessStart = Date.now();
+            const output = await this.postprocessOutput(rawOutput);
+            timings.postprocess = Date.now() - postprocessStart;
+
+            return {
+                requestId: request.id,
+                output,
+                metrics: {
+                    latency: Date.now() - preprocessStart,
+                    preprocessingTime: timings.preprocess,
+                    inferenceTime: timings.inference,
+                    postprocessingTime: timings.postprocess
+                },
+                metadata: {
+                    modelId: config.modelId,
+                    version: config.version,
+                    timestamp: new Date()
+                }
+            };
+
+        } catch (error) {
+            throw error;
+        }
+    }
+
+    private async preprocessInput(input: any): Promise<tf.Tensor> {
+        // Implement input preprocessing
+        return tf.tensor(input);
+    }
+
+    private async postprocessOutput(output: tf.Tensor): Promise<any> {
+        // Implement output postprocessing
+        return await output.array();
+    }
+
+    private async checkCache(request: InferenceRequest): Promise<InferenceResponse | null> {
+        const cacheKey = this.buildCacheKey(request);
+        return this.cache.get<InferenceResponse>(cacheKey);
+    }
+
+    private async cacheResponse(
+        request: InferenceRequest,
+        response: InferenceResponse
+    ): Promise<void> {
+        const cacheKey = this.buildCacheKey(request);
+        await this.cache.set(cacheKey, response, { ttl: 300 }); // 5 minutes
+    }
+
+    private buildCacheKey(request: InferenceRequest): string {
+        return `inference:${request.modelId}:${JSON.stringify(request.input)}`;
+    }
+
+    private getModelKey(modelId: string, version: string): string {
+        return `${modelId}@${version}`;
+    }
+
+    private async recordMetrics(
+        request: InferenceRequest,
+        response: InferenceResponse
+    ): Promise<void> {
+        await this.monitor.recordMetric({
+            name: 'model_inference',
+            value: response.metrics.latency,
+            labels: {
+                model_id: request.modelId,
+                status: 'success'
+            }
         });
     }
 
-    private async startInstanceMonitoring(instanceId: string): Promise<void> {
-        // Implementation for instance monitoring
+    private async setupHealthCheck(): Promise<void> {
         setInterval(async () => {
-            await this.updateInstanceMetrics(instanceId);
-        }, 60000); // Update metrics every minute
+            try {
+                for (const [key, model] of this.loadedModels.entries()) {
+                    const [modelId, version] = key.split('@');
+                    const status = await this.checkModelHealth(model);
+
+                    await this.monitor.recordMetric({
+                        name: 'model_health',
+                        value: status ? 1 : 0,
+                        labels: {
+                            model_id: modelId,
+                            version
+                        }
+                    });
+                }
+            } catch (error) {
+                await this.handleError('health_check_error', error);
+            }
+        }, 60000); // Every minute
     }
 
-    private async updateInstanceMetrics(instanceId: string): Promise<void> {
-        const instance = this.instances.get(instanceId);
-        if (!instance) return;
-
+    private async checkModelHealth(model: tf.GraphModel): Promise<boolean> {
         try {
-            // Collect metrics from Cloud Run
-            const metrics = await this.collectInstanceMetrics(instance);
-            
-            // Update instance metrics
-            instance.metrics = {
-                ...metrics,
-                lastUpdated: new Date()
-            };
-
-            // Record metrics
-            await this.monitor.recordMetric({
-                name: 'instance_metrics',
-                value: metrics.latency,
-                labels: {
-                    instance_id: instanceId,
-                    throughput: metrics.throughput.toString(),
-                    error_rate: metrics.errorRate.toString()
-                }
-            });
-
-            // Check for anomalies
-            await this.checkMetricsAnomalies(instance);
-        } catch (error) {
-            console.error(`Failed to update metrics for instance ${instanceId}:`, error);
+            // Perform simple inference with dummy data
+            const dummyInput = tf.zeros(model.inputs[0].shape);
+            await model.predict(dummyInput);
+            return true;
+        } catch {
+            return false;
         }
     }
 
-    private async collectInstanceMetrics(instance: ModelInstance): Promise<Omit<ModelInstance['metrics'], 'lastUpdated'>> {
-        // Implementation for metrics collection
-        return {
-            latency: 100,
-            throughput: 1000,
-            errorRate: 0.01
-        };
+    private startMetricsCollection(): void {
+        setInterval(async () => {
+            try {
+                const metrics = {
+                    activeModels: this.loadedModels.size,
+                    pendingRequests: this.requestQueue.size,
+                    memoryUsage: process.memoryUsage().heapUsed
+                };
+
+                await this.monitor.recordMetric({
+                    name: 'serving_stats',
+                    value: metrics.activeModels,
+                    labels: {
+                        pending_requests: metrics.pendingRequests.toString(),
+                        memory_usage: metrics.memoryUsage.toString()
+                    }
+                });
+            } catch (error) {
+                await this.handleError('metrics_collection_error', error);
+            }
+        }, 5000); // Every 5 seconds
     }
 
-    private async checkMetricsAnomalies(instance: ModelInstance): Promise<void> {
-        const { metrics } = instance;
-        
-        if (metrics.errorRate > 0.1) {
-            await this.monitor.recordMetric({
-                name: 'instance_alert',
-                value: 1,
-                labels: {
-                    instance_id: instance.id,
-                    type: 'high_error_rate'
-                }
-            });
-        }
-
-        if (metrics.latency > 1000) {
-            await this.monitor.recordMetric({
-                name: 'instance_alert',
-                value: 1,
-                labels: {
-                    instance_id: instance.id,
-                    type: 'high_latency'
-                }
-            });
-        }
+    private async handleError(type: string, error: Error): Promise<void> {
+        await this.monitor.recordMetric({
+            name: type,
+            value: 1,
+            labels: { error: error.message }
+        });
     }
 }
