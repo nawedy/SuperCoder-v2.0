@@ -1,147 +1,155 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
-import { SecurityScanner } from '../security/security-scanner';
-import { EncryptionService } from '../security/encryption-service';
+import { EventBusService } from '../events/event-bus-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
-import { Storage } from '@google-cloud/storage';
+import { SecurityConfig } from '../config/security-config';
+import { HSMBindingService } from '../security/hsm-binding-service';
+import { CloudStorage } from '@google-cloud/storage';
 import { BigQuery } from '@google-cloud/bigquery';
+import { ModelPerformanceService } from '../monitoring/model-performance-service';
+import { v4 as uuidv4 } from 'uuid';
 
 interface ModelMetadata {
+    id: string;
     name: string;
     version: string;
-    type: string;
-    framework?: string;
-    metrics: Record<string, number>;
-    artifacts?: {
-        path: string;
-        type: string;
-        size: number;
-        hash: string;
-    }[];
-    dependencies?: {
-        name: string;
-        version: string;
-    }[];
-    training?: {
-        startTime: Date;
-        endTime: Date;
-        parameters: Record<string, any>;
-        datasetId: string;
-    };
-    validation?: {
-        accuracy: number;
-        loss: number;
-        metrics: Record<string, number>;
-    };
-    deployment?: {
-        environment: string;
-        status: 'active' | 'inactive';
-        instances: number;
+    description: string;
+    type: ModelType;
+    framework: string;
+    createdAt: Date;
+    updatedAt: Date;
+    status: ModelStatus;
+    performance: ModelPerformanceMetrics;
+    security: SecurityMetadata;
+    dependencies: string[];
+    artifacts: ArtifactMetadata[];
+    config: ModelConfig;
+    tags: string[];
+}
+
+interface ModelPerformanceMetrics {
+    accuracy: number;
+    latency: number;
+    throughput: number;
+    resourceUsage: {
+        cpu: number;
+        memory: number;
+        gpu?: number;
     };
 }
 
-interface ModelVersion {
-    modelId: string;
-    version: string;
-    metadata: ModelMetadata;
-    data: Buffer;
-    createdAt: Date;
-    updatedAt: Date;
-    status: 'draft' | 'validated' | 'deployed' | 'archived';
-    security: {
-        scanned: boolean;
-        vulnerabilities: any[];
-        score: number;
+interface SecurityMetadata {
+    encryptionStatus: boolean;
+    keyId?: string;
+    hash: string;
+    signature?: string;
+    vulnerabilities: {
+        critical: number;
+        high: number;
+        medium: number;
+        low: number;
     };
 }
+
+interface ArtifactMetadata {
+    id: string;
+    type: 'model' | 'config' | 'checkpoint' | 'metrics';
+    path: string;
+    size: number;
+    hash: string;
+    encrypted: boolean;
+}
+
+interface ModelConfig {
+    hyperparameters: Record<string, any>;
+    architecture: Record<string, any>;
+    training: {
+        epochs: number;
+        batchSize: number;
+        optimizerConfig: Record<string, any>;
+    };
+}
+
+type ModelType = 'transformer' | 'lstm' | 'gpt' | 'custom';
+type ModelStatus = 'draft' | 'training' | 'validating' | 'deployed' | 'archived' | 'failed';
 
 export class ModelRegistryService {
     private monitor: MonitoringService;
-    private security: SecurityScanner;
-    private encryption: EncryptionService;
+    private eventBus: EventBusService;
     private audit: AuditTrailService;
-    private storage: Storage;
+    private security: SecurityConfig;
+    private hsm: HSMBindingService;
+    private storage: CloudStorage;
     private bigquery: BigQuery;
-    private readonly bucketName: string;
-    private readonly datasetId: string;
+    private performance: ModelPerformanceService;
+    private models: Map<string, ModelMetadata>;
+    private readonly ARTIFACT_BUCKET: string;
+    private readonly METRICS_TABLE: string;
 
     constructor(
         monitor: MonitoringService,
-        security: SecurityScanner,
-        encryption: EncryptionService,
+        eventBus: EventBusService,
         audit: AuditTrailService,
-        projectId: string
+        security: SecurityConfig,
+        hsm: HSMBindingService,
+        performance: ModelPerformanceService,
+        config: {
+            projectId: string;
+            region: string;
+        }
     ) {
         this.monitor = monitor;
-        this.security = security;
-        this.encryption = encryption;
+        this.eventBus = eventBus;
         this.audit = audit;
-        this.storage = new Storage({ projectId });
-        this.bigquery = new BigQuery({ projectId });
-        this.bucketName = `${projectId}-model-registry`;
-        this.datasetId = 'model_registry';
+        this.security = security;
+        this.hsm = hsm;
+        this.storage = new CloudStorage({ projectId: config.projectId });
+        this.bigquery = new BigQuery({ projectId: config.projectId });
+        this.performance = performance;
+        this.models = new Map();
+        this.ARTIFACT_BUCKET = `${config.projectId}-model-artifacts`;
+        this.METRICS_TABLE = 'model_metrics';
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
-        await this.ensureInfrastructure();
+        await this.setupInfrastructure();
+        await this.loadModels();
+        this.setupEventListeners();
     }
 
     async registerModel(
-        modelData: Buffer,
-        metadata: ModelMetadata
+        name: string,
+        metadata: Omit<ModelMetadata, 'id' | 'createdAt' | 'updatedAt' | 'status'>
     ): Promise<string> {
-        const startTime = Date.now();
         try {
-            // Generate model ID
-            const modelId = this.generateModelId(metadata.name);
-
             // Validate metadata
             await this.validateMetadata(metadata);
 
-            // Scan model for security issues
-            const securityScan = await this.security.scanModel(modelData);
-            if (securityScan.score < 0.7) { // 70% security threshold
-                throw new Error('Model failed security scan');
-            }
-
-            // Encrypt model data
-            const encryptedData = await this.encryption.encrypt(modelData);
-
-            // Create model version
-            const version: ModelVersion = {
-                modelId,
-                version: metadata.version,
-                metadata,
-                data: encryptedData,
+            const modelId = uuidv4();
+            const model: ModelMetadata = {
+                ...metadata,
+                id: modelId,
+                name,
                 createdAt: new Date(),
                 updatedAt: new Date(),
-                status: 'draft',
-                security: {
-                    scanned: true,
-                    vulnerabilities: securityScan.vulnerabilities,
-                    score: securityScan.score
-                }
+                status: 'draft'
             };
 
-            // Store model data
-            await this.storeModelData(modelId, version);
+            // Store model metadata
+            await this.storeModelMetadata(model);
 
-            // Store metadata
-            await this.storeModelMetadata(version);
+            // Process and store artifacts
+            await this.processArtifacts(model);
 
-            await this.monitor.recordMetric({
-                name: 'model_registered',
-                value: Date.now() - startTime,
-                labels: {
-                    model_id: modelId,
-                    version: metadata.version,
-                    type: metadata.type
-                }
-            });
+            // Generate security metadata
+            model.security = await this.generateSecurityMetadata(model);
+
+            // Update model registry
+            this.models.set(modelId, model);
 
             await this.audit.logEvent({
-                eventType: 'model.train',
+                eventType: 'model.deploy',
                 actor: {
                     id: 'system',
                     type: 'service',
@@ -159,8 +167,9 @@ export class ModelRegistryService {
                 },
                 status: 'success',
                 details: {
+                    name,
                     version: metadata.version,
-                    security_score: securityScan.score
+                    type: metadata.type
                 }
             });
 
@@ -172,43 +181,75 @@ export class ModelRegistryService {
         }
     }
 
-    async getModel(modelId: string, version?: string): Promise<ModelVersion | null> {
+    async updateModelStatus(
+        modelId: string,
+        status: ModelStatus,
+        performance?: Partial<ModelPerformanceMetrics>
+    ): Promise<void> {
         try {
-            const query = this.bigquery.dataset(this.datasetId).table('models').query(`
-                SELECT *
-                FROM models
-                WHERE model_id = @modelId
-                ${version ? 'AND version = @version' : ''}
-                ORDER BY created_at DESC
-                LIMIT 1
-            `);
-
-            const [rows] = await query.run({
-                params: { modelId, version }
-            });
-
-            if (!rows.length) {
-                return null;
+            const model = await this.getModel(modelId);
+            if (!model) {
+                throw new Error(`Model not found: ${modelId}`);
             }
 
-            const modelVersion = this.deserializeModelVersion(rows[0]);
-            
-            // Get model data from storage
-            const data = await this.getModelData(modelId, modelVersion.version);
-            
-            // Decrypt model data
-            modelVersion.data = await this.encryption.decrypt(data);
+            model.status = status;
+            model.updatedAt = new Date();
 
-            await this.monitor.recordMetric({
-                name: 'model_retrieved',
-                value: 1,
-                labels: {
-                    model_id: modelId,
-                    version: version || 'latest'
+            if (performance) {
+                model.performance = {
+                    ...model.performance,
+                    ...performance
+                };
+
+                // Update performance metrics
+                await this.performance.recordMetrics(modelId, performance);
+            }
+
+            // Update storage
+            await this.storeModelMetadata(model);
+
+            await this.eventBus.publish('model.status.updated', {
+                type: 'model.status',
+                source: 'model-registry',
+                data: {
+                    modelId,
+                    status,
+                    performance,
+                    timestamp: new Date()
+                },
+                metadata: {
+                    environment: process.env.NODE_ENV || 'development'
                 }
             });
 
-            return modelVersion;
+        } catch (error) {
+            await this.handleError('model_status_update_error', error);
+            throw error;
+        }
+    }
+
+    async getModel(modelId: string): Promise<ModelMetadata | null> {
+        try {
+            // Check cache first
+            if (this.models.has(modelId)) {
+                return this.models.get(modelId)!;
+            }
+
+            // Query BigQuery
+            const [rows] = await this.bigquery.query({
+                query: `
+                    SELECT *
+                    FROM \`models.metadata\`
+                    WHERE id = @modelId
+                `,
+                params: { modelId }
+            });
+
+            if (!rows.length) return null;
+
+            const model = this.deserializeModel(rows[0]);
+            this.models.set(modelId, model);
+            return model;
 
         } catch (error) {
             await this.handleError('model_retrieval_error', error);
@@ -216,154 +257,327 @@ export class ModelRegistryService {
         }
     }
 
-    async updateModelStatus(
-        modelId: string,
-        version: string,
-        status: ModelVersion['status']
-    ): Promise<void> {
+    async listModels(
+        filters?: {
+            type?: ModelType;
+            status?: ModelStatus;
+            tags?: string[];
+        }
+    ): Promise<ModelMetadata[]> {
         try {
-            await this.bigquery
-                .dataset(this.datasetId)
-                .table('models')
-                .query(`
-                    UPDATE models
-                    SET status = @status,
-                        updated_at = CURRENT_TIMESTAMP()
-                    WHERE model_id = @modelId
-                    AND version = @version
-                `).run({
-                    params: { modelId, version, status }
-                });
+            let query = `SELECT * FROM \`models.metadata\``;
+            const conditions: string[] = [];
+            const params: any = {};
 
-            await this.monitor.recordMetric({
-                name: 'model_status_updated',
-                value: 1,
-                labels: {
-                    model_id: modelId,
-                    version,
-                    status
-                }
-            });
+            if (filters?.type) {
+                conditions.push('type = @type');
+                params.type = filters.type;
+            }
+            if (filters?.status) {
+                conditions.push('status = @status');
+                params.status = filters.status;
+            }
+            if (filters?.tags?.length) {
+                conditions.push('EXISTS (SELECT 1 FROM UNNEST(tags) AS tag WHERE tag IN UNNEST(@tags))');
+                params.tags = filters.tags;
+            }
+
+            if (conditions.length) {
+                query += ` WHERE ${conditions.join(' AND ')}`;
+            }
+
+            const [rows] = await this.bigquery.query({ query, params });
+            return rows.map(this.deserializeModel);
 
         } catch (error) {
-            await this.handleError('model_update_error', error);
+            await this.handleError('model_list_error', error);
             throw error;
         }
     }
 
-    private async ensureInfrastructure(): Promise<void> {
-        try {
-            // Ensure storage bucket exists
-            const [bucketExists] = await this.storage
-                .bucket(this.bucketName)
-                .exists();
-            
-            if (!bucketExists) {
-                await this.storage.createBucket(this.bucketName, {
-                    location: 'US',
-                    storageClass: 'STANDARD'
-                });
-            }
-
-            // Ensure BigQuery dataset and table exist
-            const dataset = this.bigquery.dataset(this.datasetId);
-            const [datasetExists] = await dataset.exists();
-            
-            if (!datasetExists) {
-                await dataset.create();
-                await this.createModelTable(dataset);
-            }
-        } catch (error) {
-            console.error('Failed to initialize registry infrastructure:', error);
-            throw error;
-        }
-    }
-
-    private async createModelTable(dataset: any): Promise<void> {
-        const schema = {
-            fields: [
-                { name: 'model_id', type: 'STRING' },
-                { name: 'version', type: 'STRING' },
-                { name: 'metadata', type: 'JSON' },
-                { name: 'status', type: 'STRING' },
-                { name: 'security', type: 'JSON' },
-                { name: 'created_at', type: 'TIMESTAMP' },
-                { name: 'updated_at', type: 'TIMESTAMP' }
-            ]
-        };
-
-        await dataset.createTable('models', { schema });
-    }
-
-    private async storeModelData(
+    async downloadArtifact(
         modelId: string,
-        version: ModelVersion
-    ): Promise<void> {
-        const filename = `${modelId}/${version.version}/model.bin`;
-        await this.storage
-            .bucket(this.bucketName)
-            .file(filename)
-            .save(version.data);
-    }
-
-    private async getModelData(
-        modelId: string,
-        version: string
+        artifactId: string
     ): Promise<Buffer> {
-        const filename = `${modelId}/${version}/model.bin`;
-        const [data] = await this.storage
-            .bucket(this.bucketName)
-            .file(filename)
-            .download();
-        
-        return data;
+        try {
+            const model = await this.getModel(modelId);
+            if (!model) {
+                throw new Error(`Model not found: ${modelId}`);
+            }
+
+            const artifact = model.artifacts.find(a => a.id === artifactId);
+            if (!artifact) {
+                throw new Error(`Artifact not found: ${artifactId}`);
+            }
+
+            // Download from Cloud Storage
+            const file = this.storage
+                .bucket(this.ARTIFACT_BUCKET)
+                .file(artifact.path);
+
+            const [data] = await file.download();
+
+            // Verify integrity
+            const hash = await this.calculateHash(data);
+            if (hash !== artifact.hash) {
+                throw new Error('Artifact integrity check failed');
+            }
+
+            // Decrypt if necessary
+            if (artifact.encrypted) {
+                return await this.decryptArtifact(data, model.security.keyId!);
+            }
+
+            return data;
+
+        } catch (error) {
+            await this.handleError('artifact_download_error', error);
+            throw error;
+        }
     }
 
-    private async storeModelMetadata(version: ModelVersion): Promise<void> {
-        await this.bigquery
-            .dataset(this.datasetId)
-            .table('models')
-            .insert([{
-                model_id: version.modelId,
-                version: version.version,
-                metadata: JSON.stringify(version.metadata),
-                status: version.status,
-                security: JSON.stringify(version.security),
-                created_at: version.createdAt,
-                updated_at: version.updatedAt
-            }]);
-    }
-
-    private deserializeModelVersion(row: any): ModelVersion {
-        return {
-            modelId: row.model_id,
-            version: row.version,
-            metadata: JSON.parse(row.metadata),
-            data: Buffer.from([]), // Will be loaded separately
-            createdAt: new Date(row.created_at),
-            updatedAt: new Date(row.updated_at),
-            status: row.status,
-            security: JSON.parse(row.security)
-        };
-    }
-
-    private async validateMetadata(metadata: ModelMetadata): Promise<void> {
-        if (!metadata.name || !metadata.version || !metadata.type) {
+    private async validateMetadata(
+        metadata: Partial<ModelMetadata>
+    ): Promise<void> {
+        if (!metadata.version || !metadata.type || !metadata.framework) {
             throw new Error('Missing required metadata fields');
         }
 
-        if (metadata.version && !this.isValidVersion(metadata.version)) {
+        // Validate version format
+        if (!/^\d+\.\d+\.\d+$/.test(metadata.version)) {
             throw new Error('Invalid version format');
+        }
+
+        // Validate artifacts
+        if (metadata.artifacts) {
+            for (const artifact of metadata.artifacts) {
+                if (!artifact.type || !artifact.path) {
+                    throw new Error('Invalid artifact metadata');
+                }
+            }
+        }
+
+        // Validate config
+        if (metadata.config) {
+            if (!metadata.config.hyperparameters || !metadata.config.architecture) {
+                throw new Error('Invalid model configuration');
+            }
         }
     }
 
-    private isValidVersion(version: string): boolean {
-        return /^\d+\.\d+\.\d+$/.test(version);
+    private async processArtifacts(model: ModelMetadata): Promise<void> {
+        for (const artifact of model.artifacts) {
+            // Generate artifact ID if not present
+            if (!artifact.id) {
+                artifact.id = uuidv4();
+            }
+
+            // Upload to Cloud Storage
+            const file = this.storage
+                .bucket(this.ARTIFACT_BUCKET)
+                .file(artifact.path);
+
+            // Calculate hash before encryption
+            const data = await file.download();
+            artifact.hash = await this.calculateHash(data[0]);
+
+            // Encrypt if required
+            if (this.security.encryption.enabled) {
+                const encrypted = await this.encryptArtifact(
+                    data[0],
+                    model.security.keyId!
+                );
+                await file.save(encrypted);
+                artifact.encrypted = true;
+            }
+        }
     }
 
-    private generateModelId(name: string): string {
-        const sanitizedName = name.toLowerCase().replace(/[^a-z0-9]/g, '-');
-        return `${sanitizedName}-${Date.now()}`;
+    private async generateSecurityMetadata(
+        model: ModelMetadata
+    ): Promise<SecurityMetadata> {
+        // Generate encryption key if needed
+        let keyId;
+        if (this.security.encryption.enabled) {
+            const key = await this.hsm.generateKey(
+                'model',
+                { purpose: 'encryption' }
+            );
+            keyId = key.id;
+        }
+
+        // Calculate model hash
+        const modelHash = await this.calculateModelHash(model);
+
+        // Sign model metadata if configured
+        let signature;
+        if (this.security.signing.enabled) {
+            const signResult = await this.hsm.sign(
+                keyId!,
+                Buffer.from(modelHash)
+            );
+            signature = signResult.signature.toString('base64');
+        }
+
+        return {
+            encryptionStatus: !!keyId,
+            keyId,
+            hash: modelHash,
+            signature,
+            vulnerabilities: {
+                critical: 0,
+                high: 0,
+                medium: 0,
+                low: 0
+            }
+        };
+    }
+
+    private async calculateModelHash(model: ModelMetadata): Promise<string> {
+        const content = JSON.stringify({
+            name: model.name,
+            version: model.version,
+            type: model.type,
+            framework: model.framework,
+            config: model.config,
+            artifacts: model.artifacts.map(a => ({
+                id: a.id,
+                type: a.type,
+                hash: a.hash
+            }))
+        });
+
+        return crypto
+            .createHash('sha256')
+            .update(content)
+            .digest('hex');
+    }
+
+    private async calculateHash(data: Buffer): Promise<string> {
+        return crypto
+            .createHash('sha256')
+            .update(data)
+            .digest('hex');
+    }
+
+    private async encryptArtifact(
+        data: Buffer,
+        keyId: string
+    ): Promise<Buffer> {
+        const result = await this.hsm.encrypt(keyId, data);
+        return result.ciphertext;
+    }
+
+    private async decryptArtifact(
+        data: Buffer,
+        keyId: string
+    ): Promise<Buffer> {
+        const result = await this.hsm.decrypt(keyId, data);
+        return result.plaintext;
+    }
+
+    private async storeModelMetadata(model: ModelMetadata): Promise<void> {
+        const row = this.serializeModel(model);
+        await this.bigquery
+            .dataset('models')
+            .table('metadata')
+            .insert([row]);
+    }
+
+    private serializeModel(model: ModelMetadata): Record<string, any> {
+        return {
+            ...model,
+            performance: JSON.stringify(model.performance),
+            security: JSON.stringify(model.security),
+            config: JSON.stringify(model.config),
+            artifacts: JSON.stringify(model.artifacts),
+            createdAt: model.createdAt.toISOString(),
+            updatedAt: model.updatedAt.toISOString()
+        };
+    }
+
+    private deserializeModel(row: any): ModelMetadata {
+        return {
+            ...row,
+            performance: JSON.parse(row.performance),
+            security: JSON.parse(row.security),
+            config: JSON.parse(row.config),
+            artifacts: JSON.parse(row.artifacts),
+            createdAt: new Date(row.createdAt),
+            updatedAt: new Date(row.updatedAt)
+        };
+    }
+
+    private async setupInfrastructure(): Promise<void> {
+        try {
+            // Create Cloud Storage bucket
+            const [bucketExists] = await this.storage
+                .bucket(this.ARTIFACT_BUCKET)
+                .exists();
+            if (!bucketExists) {
+                await this.storage.createBucket(this.ARTIFACT_BUCKET);
+            }
+
+            // Create BigQuery dataset and tables
+            const dataset = this.bigquery.dataset('models');
+            const [datasetExists] = await dataset.exists();
+            if (!datasetExists) {
+                await dataset.create();
+                await this.createModelTables(dataset);
+            }
+
+        } catch (error) {
+            console.error('Failed to setup model registry infrastructure:', error);
+            throw error;
+        }
+    }
+
+    private async createModelTables(dataset: any): Promise<void> {
+        const metadataSchema = {
+            fields: [
+                { name: 'id', type: 'STRING' },
+                { name: 'name', type: 'STRING' },
+                { name: 'version', type: 'STRING' },
+                { name: 'description', type: 'STRING' },
+                { name: 'type', type: 'STRING' },
+                { name: 'framework', type: 'STRING' },
+                { name: 'createdAt', type: 'TIMESTAMP' },
+                { name: 'updatedAt', type: 'TIMESTAMP' },
+                { name: 'status', type: 'STRING' },
+                { name: 'performance', type: 'JSON' },
+                { name: 'security', type: 'JSON' },
+                { name: 'dependencies', type: 'STRING', mode: 'REPEATED' },
+                { name: 'artifacts', type: 'JSON' },
+                { name: 'config', type: 'JSON' },
+                { name: 'tags', type: 'STRING', mode: 'REPEATED' }
+            ]
+        };
+
+        await dataset.createTable('metadata', { schema: metadataSchema });
+    }
+
+    private async loadModels(): Promise<void> {
+        const [rows] = await this.bigquery.query(`
+            SELECT *
+            FROM \`models.metadata\`
+            WHERE status != 'archived'
+        `);
+
+        for (const row of rows) {
+            const model = this.deserializeModel(row);
+            this.models.set(model.id, model);
+        }
+    }
+
+    private setupEventListeners(): void {
+        this.eventBus.subscribe({
+            id: 'model-registry-monitor',
+            topic: 'model.performance',
+            handler: async (event) => {
+                const { modelId, metrics } = event.data;
+                await this.updateModelStatus(modelId, 'deployed', metrics);
+            }
+        });
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
@@ -372,5 +586,22 @@ export class ModelRegistryService {
             value: 1,
             labels: { error: error.message }
         });
+
+        await this.eventBus.publish('model.error', {
+            type: 'model.error',
+            source: 'model-registry',
+            data: {
+                error: error.message,
+                timestamp: new Date()
+            },
+            metadata: {
+                severity: 'high',
+                environment: process.env.NODE_ENV || 'development'
+            }
+        });
+    }
+
+    async shutdown(): Promise<void> {
+        this.models.clear();
     }
 }

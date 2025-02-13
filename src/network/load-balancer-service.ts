@@ -1,400 +1,378 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
-import { HealthCheckService } from '../monitoring/health-check-service';
 import { EventBusService } from '../events/event-bus-service';
-import { Redis } from 'ioredis';
-import * as crypto from 'crypto';
+import { ServiceDiscoveryService } from '../discovery/service-discovery-service';
+import { HealthCheckService } from '../health/health-check-service';
 
-interface ServiceNode {
+interface LoadBalancerConfig {
+    algorithm: 'round-robin' | 'least-connections' | 'weighted' | 'ip-hash';
+    maxRetries: number;
+    timeout: number;
+    healthCheck: {
+        enabled: boolean;
+        interval: number;
+        timeout: number;
+        unhealthyThreshold: number;
+        healthyThreshold: number;
+    };
+    session: {
+        enabled: boolean;
+        ttl: number;
+    };
+}
+
+interface ServerNode {
     id: string;
     host: string;
     port: number;
     weight: number;
-    tags: string[];
-    metadata: {
-        region: string;
-        zone: string;
-        capacity: number;
-    };
-    health: {
-        healthy: boolean;
-        lastCheck: Date;
-        failureCount: number;
-        latency: number;
+    currentConnections: number;
+    totalRequests: number;
+    status: 'healthy' | 'unhealthy' | 'draining';
+    lastHealthCheck: Date;
+    metrics: {
+        responseTime: number[];
+        errorRate: number;
+        cpu: number;
+        memory: number;
     };
 }
 
-interface BalancingStrategy {
-    type: 'round-robin' | 'least-connections' | 'weighted' | 'consistent-hash';
-    config?: {
-        hashKey?: string;
-        weightAttribute?: string;
-    };
-}
-
-interface LoadBalancerConfig {
-    healthCheck: {
-        interval: number;
-        timeout: number;
-        failureThreshold: number;
-        successThreshold: number;
-    };
-    strategy: BalancingStrategy;
-    stickiness?: {
-        enabled: boolean;
-        timeout: number;
-    };
-    maxRetries: number;
-    drainTimeout: number;
+interface SessionData {
+    id: string;
+    nodeId: string;
+    createdAt: Date;
+    lastUsed: Date;
+    metadata: Record<string, any>;
 }
 
 export class LoadBalancerService {
     private monitor: MonitoringService;
-    private health: HealthCheckService;
     private eventBus: EventBusService;
-    private redis: Redis;
-    private nodes: Map<string, ServiceNode>;
+    private discovery: ServiceDiscoveryService;
+    private healthCheck: HealthCheckService;
+    private nodes: Map<string, ServerNode>;
+    private sessions: Map<string, SessionData>;
+    private currentNodeIndex: number;
     private config: LoadBalancerConfig;
-    private lastNodeIndex: number;
-    private readonly consistentHashRing: Map<number, string>;
-    private readonly HASH_REPLICAS = 100;
+    private readonly METRICS_WINDOW = 60; // 1 minute
+    private readonly CLEANUP_INTERVAL = 300000; // 5 minutes
 
     constructor(
         monitor: MonitoringService,
-        health: HealthCheckService,
         eventBus: EventBusService,
-        config: LoadBalancerConfig,
-        redisUrl: string
+        discovery: ServiceDiscoveryService,
+        healthCheck: HealthCheckService,
+        config: LoadBalancerConfig
     ) {
         this.monitor = monitor;
-        this.health = health;
         this.eventBus = eventBus;
+        this.discovery = discovery;
+        this.healthCheck = healthCheck;
         this.config = config;
-        this.redis = new Redis(redisUrl);
         this.nodes = new Map();
-        this.lastNodeIndex = 0;
-        this.consistentHashRing = new Map();
+        this.sessions = new Map();
+        this.currentNodeIndex = 0;
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
-        await this.registerHealthChecks();
-        this.startBackgroundTasks();
+        await this.discoverNodes();
+        this.startHealthChecks();
+        this.startMetricsCollection();
+        this.startSessionCleanup();
+        this.setupEventListeners();
     }
 
-    async registerNode(node: Omit<ServiceNode, 'health'>): Promise<void> {
+    async route(
+        request: {
+            id: string;
+            sessionId?: string;
+            clientIp: string;
+            path: string;
+            headers: Record<string, string>;
+        }
+    ): Promise<ServerNode> {
+        const startTime = Date.now();
         try {
-            const nodeId = node.id || this.generateNodeId();
+            // Check session affinity
+            if (this.config.session.enabled && request.sessionId) {
+                const sessionNode = await this.getSessionNode(request.sessionId);
+                if (sessionNode && sessionNode.status === 'healthy') {
+                    return sessionNode;
+                }
+            }
+
+            // Get available nodes
+            const availableNodes = Array.from(this.nodes.values())
+                .filter(node => node.status === 'healthy');
+
+            if (!availableNodes.length) {
+                throw new Error('No healthy nodes available');
+            }
+
+            // Select node based on algorithm
+            const node = await this.selectNode(request, availableNodes);
             
-            // Create complete node object
-            const newNode: ServiceNode = {
-                ...node,
-                id: nodeId,
-                health: {
-                    healthy: true,
-                    lastCheck: new Date(),
-                    failureCount: 0,
-                    latency: 0
-                }
-            };
+            // Update node metrics
+            node.currentConnections++;
+            node.totalRequests++;
 
-            // Store node
-            this.nodes.set(nodeId, newNode);
-
-            // Update consistent hash ring
-            if (this.config.strategy.type === 'consistent-hash') {
-                this.addNodeToHashRing(newNode);
+            // Create session if enabled
+            if (this.config.session.enabled && request.sessionId) {
+                await this.createSession(request.sessionId, node.id);
             }
 
-            // Register health check
-            await this.registerNodeHealthCheck(newNode);
-
+            // Record metrics
             await this.monitor.recordMetric({
-                name: 'node_registered',
-                value: 1,
+                name: 'load_balancer_route',
+                value: Date.now() - startTime,
                 labels: {
-                    node_id: nodeId,
-                    region: node.metadata.region
+                    node_id: node.id,
+                    algorithm: this.config.algorithm
                 }
             });
 
+            return node;
+
         } catch (error) {
-            await this.handleError('node_registration_error', error);
+            await this.handleError('routing_error', error);
             throw error;
         }
     }
 
-    async getNode(key?: string): Promise<ServiceNode> {
-        try {
-            if (this.nodes.size === 0) {
-                throw new Error('No available nodes');
-            }
+    async markRequestComplete(nodeId: string, responseTime: number): Promise<void> {
+        const node = this.nodes.get(nodeId);
+        if (!node) return;
 
-            let selectedNode: ServiceNode;
+        node.currentConnections--;
+        node.metrics.responseTime.push(responseTime);
 
-            switch (this.config.strategy.type) {
-                case 'round-robin':
-                    selectedNode = await this.getRoundRobinNode();
-                    break;
-                case 'least-connections':
-                    selectedNode = await this.getLeastConnectionsNode();
-                    break;
-                case 'weighted':
-                    selectedNode = await this.getWeightedNode();
-                    break;
-                case 'consistent-hash':
-                    if (!key) throw new Error('Hash key required for consistent hashing');
-                    selectedNode = await this.getConsistentHashNode(key);
-                    break;
-                default:
-                    throw new Error(`Unsupported balancing strategy: ${this.config.strategy.type}`);
-            }
+        // Keep only recent metrics
+        const cutoffTime = Date.now() - (this.METRICS_WINDOW * 1000);
+        node.metrics.responseTime = node.metrics.responseTime.filter(t => 
+            t > cutoffTime
+        );
 
-            if (!selectedNode.health.healthy) {
-                throw new Error('Selected node is unhealthy');
-            }
-
-            await this.monitor.recordMetric({
-                name: 'node_selected',
-                value: 1,
-                labels: {
-                    node_id: selectedNode.id,
-                    strategy: this.config.strategy.type
-                }
-            });
-
-            return selectedNode;
-
-        } catch (error) {
-            await this.handleError('node_selection_error', error);
-            throw error;
-        }
+        // Update error rate
+        node.metrics.errorRate = node.metrics.responseTime.length > 0 ?
+            node.metrics.responseTime.filter(t => t > this.config.timeout).length / 
+            node.metrics.responseTime.length : 0;
     }
 
-    async deregisterNode(nodeId: string, graceful: boolean = true): Promise<void> {
+    async drainNode(nodeId: string): Promise<void> {
+        const node = this.nodes.get(nodeId);
+        if (!node) return;
+
         try {
-            const node = this.nodes.get(nodeId);
-            if (!node) {
-                throw new Error(`Node not found: ${nodeId}`);
-            }
+            // Mark node as draining
+            node.status = 'draining';
 
-            if (graceful) {
-                // Wait for connections to drain
-                await this.drainConnections(node);
-            }
-
-            // Remove from consistent hash ring
-            if (this.config.strategy.type === 'consistent-hash') {
-                this.removeNodeFromHashRing(node);
+            // Wait for existing connections to complete
+            while (node.currentConnections > 0) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
             }
 
             // Remove node
             this.nodes.delete(nodeId);
 
-            await this.monitor.recordMetric({
-                name: 'node_deregistered',
-                value: 1,
-                labels: {
-                    node_id: nodeId,
-                    graceful: graceful.toString()
+            await this.eventBus.publish('loadbalancer.node.drained', {
+                type: 'node.drained',
+                source: 'load-balancer',
+                data: {
+                    nodeId,
+                    timestamp: new Date()
+                },
+                metadata: {
+                    environment: process.env.NODE_ENV || 'development'
                 }
             });
 
         } catch (error) {
-            await this.handleError('node_deregistration_error', error);
+            await this.handleError('node_drain_error', error);
             throw error;
         }
     }
 
-    private async getRoundRobinNode(): Promise<ServiceNode> {
-        const nodes = Array.from(this.nodes.values())
-            .filter(node => node.health.healthy);
-
-        if (nodes.length === 0) {
-            throw new Error('No healthy nodes available');
+    private async selectNode(
+        request: { clientIp: string; path: string },
+        nodes: ServerNode[]
+    ): Promise<ServerNode> {
+        switch (this.config.algorithm) {
+            case 'round-robin':
+                return this.selectRoundRobin(nodes);
+            case 'least-connections':
+                return this.selectLeastConnections(nodes);
+            case 'weighted':
+                return this.selectWeighted(nodes);
+            case 'ip-hash':
+                return this.selectIpHash(request.clientIp, nodes);
+            default:
+                throw new Error(`Unsupported algorithm: ${this.config.algorithm}`);
         }
-
-        this.lastNodeIndex = (this.lastNodeIndex + 1) % nodes.length;
-        return nodes[this.lastNodeIndex];
     }
 
-    private async getLeastConnectionsNode(): Promise<ServiceNode> {
-        const nodes = Array.from(this.nodes.values())
-            .filter(node => node.health.healthy)
-            .sort((a, b) => a.metadata.capacity - b.metadata.capacity);
-
-        if (nodes.length === 0) {
-            throw new Error('No healthy nodes available');
-        }
-
-        return nodes[0];
+    private selectRoundRobin(nodes: ServerNode[]): ServerNode {
+        const node = nodes[this.currentNodeIndex];
+        this.currentNodeIndex = (this.currentNodeIndex + 1) % nodes.length;
+        return node;
     }
 
-    private async getWeightedNode(): Promise<ServiceNode> {
-        const nodes = Array.from(this.nodes.values())
-            .filter(node => node.health.healthy);
+    private selectLeastConnections(nodes: ServerNode[]): ServerNode {
+        return nodes.reduce((min, node) => 
+            node.currentConnections < min.currentConnections ? node : min
+        );
+    }
 
-        if (nodes.length === 0) {
-            throw new Error('No healthy nodes available');
-        }
-
+    private selectWeighted(nodes: ServerNode[]): ServerNode {
         const totalWeight = nodes.reduce((sum, node) => sum + node.weight, 0);
         let random = Math.random() * totalWeight;
 
         for (const node of nodes) {
             random -= node.weight;
-            if (random <= 0) {
-                return node;
-            }
+            if (random <= 0) return node;
         }
 
         return nodes[0];
     }
 
-    private async getConsistentHashNode(key: string): Promise<ServiceNode> {
-        const hash = this.hash(key);
-        const points = Array.from(this.consistentHashRing.keys()).sort((a, b) => a - b);
+    private selectIpHash(clientIp: string, nodes: ServerNode[]): ServerNode {
+        const hash = this.hashString(clientIp);
+        return nodes[hash % nodes.length];
+    }
 
-        for (const point of points) {
-            if (hash <= point) {
-                const nodeId = this.consistentHashRing.get(point)!;
-                const node = this.nodes.get(nodeId)!;
-                if (node.health.healthy) {
-                    return node;
-                }
-            }
+    private hashString(str: string): number {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            hash = ((hash << 5) - hash) + str.charCodeAt(i);
+            hash = hash & hash;
         }
-
-        throw new Error('No healthy node found in hash ring');
+        return Math.abs(hash);
     }
 
-    private addNodeToHashRing(node: ServiceNode): void {
-        for (let i = 0; i < this.HASH_REPLICAS; i++) {
-            const point = this.hash(`${node.id}-${i}`);
-            this.consistentHashRing.set(point, node.id);
-        }
+    private async getSessionNode(sessionId: string): Promise<ServerNode | null> {
+        const session = this.sessions.get(sessionId);
+        if (!session) return null;
+
+        const node = this.nodes.get(session.nodeId);
+        if (!node) return null;
+
+        // Update session
+        session.lastUsed = new Date();
+        return node;
     }
 
-    private removeNodeFromHashRing(node: ServiceNode): void {
-        for (let i = 0; i < this.HASH_REPLICAS; i++) {
-            const point = this.hash(`${node.id}-${i}`);
-            this.consistentHashRing.delete(point);
-        }
+    private async createSession(
+        sessionId: string,
+        nodeId: string
+    ): Promise<void> {
+        const session: SessionData = {
+            id: sessionId,
+            nodeId,
+            createdAt: new Date(),
+            lastUsed: new Date(),
+            metadata: {}
+        };
+
+        this.sessions.set(sessionId, session);
     }
 
-    private hash(key: string): number {
-        const hash = crypto.createHash('md5').update(key).digest('hex');
-        return parseInt(hash.substring(0, 8), 16);
-    }
+    private async discoverNodes(): Promise<void> {
+        try {
+            const services = await this.discovery.discoverService({
+                type: 'backend',
+                status: 'running'
+            });
 
-    private async registerNodeHealthCheck(node: ServiceNode): Promise<void> {
-        await this.health.registerCheck({
-            id: `node-${node.id}`,
-            name: `Node Health Check - ${node.id}`,
-            type: 'dependency',
-            interval: this.config.healthCheck.interval,
-            timeout: this.config.healthCheck.timeout,
-            threshold: this.config.healthCheck.failureThreshold,
-            check: async () => {
-                const startTime = Date.now();
-                try {
-                    // Implement actual health check logic here
-                    const healthy = await this.checkNodeHealth(node);
-                    
-                    node.health.latency = Date.now() - startTime;
-                    node.health.lastCheck = new Date();
-                    
-                    if (healthy) {
-                        node.health.failureCount = 0;
-                        node.health.healthy = true;
-                    } else {
-                        node.health.failureCount++;
-                        if (node.health.failureCount >= this.config.healthCheck.failureThreshold) {
-                            node.health.healthy = false;
-                        }
+            for (const service of services) {
+                this.nodes.set(service.id, {
+                    id: service.id,
+                    host: service.host,
+                    port: service.port,
+                    weight: 1,
+                    currentConnections: 0,
+                    totalRequests: 0,
+                    status: 'healthy',
+                    lastHealthCheck: new Date(),
+                    metrics: {
+                        responseTime: [],
+                        errorRate: 0,
+                        cpu: 0,
+                        memory: 0
                     }
-
-                    return healthy;
-                } catch (error) {
-                    node.health.failureCount++;
-                    node.health.latency = Date.now() - startTime;
-                    node.health.lastCheck = new Date();
-                    
-                    if (node.health.failureCount >= this.config.healthCheck.failureThreshold) {
-                        node.health.healthy = false;
-                    }
-
-                    return false;
-                }
+                });
             }
-        });
+        } catch (error) {
+            await this.handleError('node_discovery_error', error);
+        }
     }
 
-    private async checkNodeHealth(node: ServiceNode): Promise<boolean> {
-        // Implement actual health check logic
-        return true;
-    }
+    private startHealthChecks(): void {
+        if (!this.config.healthCheck.enabled) return;
 
-    private async drainConnections(node: ServiceNode): Promise<void> {
-        // Set node as draining
-        node.health.healthy = false;
-
-        // Wait for drain timeout
-        await new Promise(resolve => setTimeout(resolve, this.config.drainTimeout));
-
-        // Emit drain event
-        await this.eventBus.publish('loadbalancer.node.drained', {
-            type: 'node.drained',
-            source: 'load-balancer',
-            data: {
-                nodeId: node.id,
-                timestamp: new Date()
-            },
-            metadata: {
-                region: node.metadata.region,
-                zone: node.metadata.zone
-            }
-        });
-    }
-
-    private startBackgroundTasks(): void {
-        // Periodic metrics collection
         setInterval(async () => {
-            try {
-                await this.collectMetrics();
-            } catch (error) {
-                await this.handleError('metrics_collection_error', error);
+            for (const node of this.nodes.values()) {
+                try {
+                    const health = await this.healthCheck.checkNode({
+                        host: node.host,
+                        port: node.port,
+                        timeout: this.config.healthCheck.timeout
+                    });
+
+                    node.status = health.healthy ? 'healthy' : 'unhealthy';
+                    node.lastHealthCheck = new Date();
+                    node.metrics.cpu = health.metrics.cpu;
+                    node.metrics.memory = health.metrics.memory;
+
+                } catch (error) {
+                    await this.handleError('health_check_error', error);
+                }
+            }
+        }, this.config.healthCheck.interval);
+    }
+
+    private startMetricsCollection(): void {
+        setInterval(async () => {
+            for (const node of this.nodes.values()) {
+                await this.monitor.recordMetric({
+                    name: 'node_metrics',
+                    value: 1,
+                    labels: {
+                        node_id: node.id,
+                        connections: node.currentConnections.toString(),
+                        error_rate: node.metrics.errorRate.toString(),
+                        status: node.status
+                    }
+                });
             }
         }, 60000); // Every minute
     }
 
-    private async collectMetrics(): Promise<void> {
-        const metrics = {
-            totalNodes: this.nodes.size,
-            healthyNodes: Array.from(this.nodes.values()).filter(n => n.health.healthy).length,
-            averageLatency: this.calculateAverageLatency()
-        };
+    private startSessionCleanup(): void {
+        if (!this.config.session.enabled) return;
 
-        await this.monitor.recordMetric({
-            name: 'load_balancer_stats',
-            value: metrics.healthyNodes,
-            labels: {
-                total_nodes: metrics.totalNodes.toString(),
-                avg_latency: metrics.averageLatency.toString()
+        setInterval(() => {
+            const now = Date.now();
+            for (const [sessionId, session] of this.sessions.entries()) {
+                if (now - session.lastUsed.getTime() > this.config.session.ttl * 1000) {
+                    this.sessions.delete(sessionId);
+                }
+            }
+        }, this.CLEANUP_INTERVAL);
+    }
+
+    private setupEventListeners(): void {
+        this.eventBus.subscribe({
+            id: 'load-balancer-monitor',
+            topic: 'node.status',
+            handler: async (event) => {
+                const { nodeId, status } = event.data;
+                const node = this.nodes.get(nodeId);
+                if (node) {
+                    node.status = status;
+                }
             }
         });
-    }
-
-    private calculateAverageLatency(): number {
-        const nodes = Array.from(this.nodes.values());
-        if (nodes.length === 0) return 0;
-
-        const totalLatency = nodes.reduce((sum, node) => sum + node.health.latency, 0);
-        return totalLatency / nodes.length;
-    }
-
-    private generateNodeId(): string {
-        return `node-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
@@ -403,16 +381,28 @@ export class LoadBalancerService {
             value: 1,
             labels: { error: error.message }
         });
+
+        await this.eventBus.publish('loadbalancer.error', {
+            type: 'loadbalancer.error',
+            source: 'load-balancer',
+            data: {
+                error: error.message,
+                timestamp: new Date()
+            },
+            metadata: {
+                severity: 'high',
+                environment: process.env.NODE_ENV || 'development'
+            }
+        });
     }
 
-    // Cleanup method for proper service shutdown
     async shutdown(): Promise<void> {
         // Drain all nodes
-        for (const node of this.nodes.values()) {
-            await this.drainConnections(node);
+        for (const [nodeId] of this.nodes.entries()) {
+            await this.drainNode(nodeId);
         }
 
-        // Close Redis connection
-        await this.redis.quit();
+        this.nodes.clear();
+        this.sessions.clear();
     }
 }

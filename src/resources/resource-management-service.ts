@@ -1,114 +1,195 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
+import { EventBusService } from '../events/event-bus-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
 import { SecurityConfig } from '../config/security-config';
-import { CloudResourceManager } from '@google-cloud/resource-manager';
-import { Compute } from '@google-cloud/compute';
+import { Compute, Instance } from '@google-cloud/compute';
+import { Container } from '@google-cloud/container';
+import { CloudTasks } from '@google-cloud/tasks';
+import { BigQuery } from '@google-cloud/bigquery';
+import { v4 as uuidv4 } from 'uuid';
 
 interface ResourceConfig {
-    type: 'compute' | 'memory' | 'storage' | 'gpu';
-    size: 'small' | 'medium' | 'large';
-    quantity: number;
-    priority: 'high' | 'medium' | 'low';
-    tags: string[];
-    autoScale?: {
-        enabled: boolean;
-        minInstances: number;
-        maxInstances: number;
-        targetUtilization: number;
+    type: ResourceType;
+    spec: {
+        cpu: number;
+        memory: number;
+        gpu?: {
+            type: string;
+            count: number;
+        };
+        disk: {
+            size: number;
+            type: string;
+        };
+    };
+    scaling: {
+        min: number;
+        max: number;
+        targetCpuUtilization: number;
+    };
+    networking: {
+        internal: boolean;
+        ports: number[];
+        subnetwork?: string;
+    };
+    security: {
+        serviceAccount?: string;
+        labels: Record<string, string>;
+        confidential: boolean;
     };
 }
 
-interface Resource {
+interface ResourceAllocation {
     id: string;
-    type: ResourceConfig['type'];
-    status: 'provisioning' | 'active' | 'scaling' | 'error' | 'terminated';
+    name: string;
+    type: ResourceType;
+    status: ResourceStatus;
     config: ResourceConfig;
-    metrics: {
-        utilization: number;
-        cost: number;
-        performance: number;
-    };
     metadata: {
         createdAt: Date;
-        lastUpdated: Date;
+        updatedAt: Date;
         expiresAt?: Date;
+        lastHealthCheck?: Date;
+    };
+    metrics: {
+        cpuUsage: number;
+        memoryUsage: number;
+        networkIn: number;
+        networkOut: number;
+        diskUsage: number;
+    };
+    costs: {
+        hourlyRate: number;
+        totalCost: number;
+        lastBilled: Date;
     };
 }
 
-interface ResourcePool {
-    id: string;
-    resources: Map<string, Resource>;
-    totalCapacity: Record<ResourceConfig['type'], number>;
-    availableCapacity: Record<ResourceConfig['type'], number>;
-    reservations: Map<string, ResourceReservation>;
-}
+type ResourceType = 
+    | 'compute-instance' 
+    | 'gke-node' 
+    | 'cloud-function' 
+    | 'cloud-run';
 
-interface ResourceReservation {
-    id: string;
-    resourceType: ResourceConfig['type'];
-    quantity: number;
-    priority: ResourceConfig['priority'];
-    expiresAt: Date;
-}
+type ResourceStatus = 
+    | 'provisioning' 
+    | 'running' 
+    | 'degraded' 
+    | 'stopped' 
+    | 'failed';
 
 export class ResourceManagementService {
     private monitor: MonitoringService;
+    private eventBus: EventBusService;
     private audit: AuditTrailService;
-    private securityConfig: SecurityConfig;
-    private resourceManager: CloudResourceManager;
+    private security: SecurityConfig;
     private compute: Compute;
-    private pools: Map<string, ResourcePool>;
-    private readonly UTILIZATION_THRESHOLD = 0.8; // 80%
+    private container: Container;
+    private tasks: CloudTasks;
+    private bigquery: BigQuery;
+    private resources: Map<string, ResourceAllocation>;
+    private readonly HEALTH_CHECK_INTERVAL = 60000; // 1 minute
+    private readonly METRICS_UPDATE_INTERVAL = 300000; // 5 minutes
+    private readonly COST_UPDATE_INTERVAL = 3600000; // 1 hour
 
     constructor(
         monitor: MonitoringService,
+        eventBus: EventBusService,
         audit: AuditTrailService,
-        securityConfig: SecurityConfig
+        security: SecurityConfig,
+        config: {
+            projectId: string;
+            zone: string;
+        }
     ) {
         this.monitor = monitor;
+        this.eventBus = eventBus;
         this.audit = audit;
-        this.securityConfig = securityConfig;
-        this.resourceManager = new CloudResourceManager();
-        this.compute = new Compute();
-        this.pools = new Map();
+        this.security = security;
+        this.compute = new Compute({ projectId: config.projectId });
+        this.container = new Container({ projectId: config.projectId });
+        this.tasks = new CloudTasks({ projectId: config.projectId });
+        this.bigquery = new BigQuery({ projectId: config.projectId });
+        this.resources = new Map();
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
-        await this.initializeResourcePools();
-        this.startResourceMonitoring();
+        await this.setupInfrastructure();
+        await this.loadExistingResources();
+        this.startHealthChecks();
+        this.startMetricsCollection();
+        this.startCostTracking();
+        this.setupEventListeners();
     }
 
-    async allocateResources(config: ResourceConfig): Promise<Resource> {
+    async allocateResource(
+        name: string,
+        config: ResourceConfig
+    ): Promise<string> {
+        const startTime = Date.now();
         try {
-            // Find suitable pool
-            const pool = await this.findSuitablePool(config);
-            if (!pool) {
-                throw new Error('No suitable resource pool available');
-            }
+            // Validate configuration
+            await this.validateResourceConfig(config);
 
-            // Check capacity
-            if (!this.hasCapacity(pool, config)) {
-                await this.scalePool(pool, config);
-            }
+            // Create resource ID
+            const resourceId = uuidv4();
 
-            // Create resource
-            const resource = await this.createResource(pool, config);
+            // Create resource allocation
+            const resource: ResourceAllocation = {
+                id: resourceId,
+                name,
+                type: config.type,
+                status: 'provisioning',
+                config,
+                metadata: {
+                    createdAt: new Date(),
+                    updatedAt: new Date()
+                },
+                metrics: {
+                    cpuUsage: 0,
+                    memoryUsage: 0,
+                    networkIn: 0,
+                    networkOut: 0,
+                    diskUsage: 0
+                },
+                costs: {
+                    hourlyRate: this.calculateHourlyRate(config),
+                    totalCost: 0,
+                    lastBilled: new Date()
+                }
+            };
 
-            // Update pool capacity
-            this.updatePoolCapacity(pool, resource, 'allocate');
+            // Store resource allocation
+            this.resources.set(resourceId, resource);
+            await this.storeResource(resource);
 
+            // Provision resource
+            await this.provisionResource(resource);
+
+            // Record metrics
+            await this.monitor.recordMetric({
+                name: 'resource_allocated',
+                value: Date.now() - startTime,
+                labels: {
+                    resource_id: resourceId,
+                    type: config.type,
+                    name
+                }
+            });
+
+            // Audit log
             await this.audit.logEvent({
-                eventType: 'system.config',
+                eventType: 'resource.allocate',
                 actor: {
                     id: 'system',
                     type: 'service',
                     metadata: {}
                 },
                 resource: {
-                    type: 'resource',
-                    id: resource.id,
+                    type: 'compute-resource',
+                    id: resourceId,
                     action: 'allocate'
                 },
                 context: {
@@ -117,10 +198,14 @@ export class ResourceManagementService {
                     userAgent: 'system'
                 },
                 status: 'success',
-                details: { config }
+                details: {
+                    resource_type: config.type,
+                    name,
+                    specs: config.spec
+                }
             });
 
-            return resource;
+            return resourceId;
 
         } catch (error) {
             await this.handleError('resource_allocation_error', error);
@@ -130,40 +215,35 @@ export class ResourceManagementService {
 
     async deallocateResource(resourceId: string): Promise<void> {
         try {
-            // Find resource and pool
-            const [pool, resource] = await this.findResource(resourceId);
+            const resource = await this.getResource(resourceId);
             if (!resource) {
                 throw new Error(`Resource not found: ${resourceId}`);
             }
 
             // Update status
-            resource.status = 'terminated';
+            resource.status = 'stopped';
+            resource.metadata.updatedAt = new Date();
 
-            // Update pool capacity
-            this.updatePoolCapacity(pool, resource, 'deallocate');
+            // Deprovision resource
+            await this.deprovisionResource(resource);
 
-            // Cleanup resource
-            await this.cleanupResource(resource);
+            // Calculate final costs
+            await this.updateResourceCosts(resource);
 
-            await this.audit.logEvent({
-                eventType: 'system.config',
-                actor: {
-                    id: 'system',
-                    type: 'service',
-                    metadata: {}
-                },
-                resource: {
-                    type: 'resource',
-                    id: resourceId,
-                    action: 'deallocate'
-                },
-                context: {
-                    location: 'resource-management',
-                    ipAddress: 'internal',
-                    userAgent: 'system'
-                },
-                status: 'success',
-                details: {}
+            // Remove from active resources
+            this.resources.delete(resourceId);
+
+            // Store final state
+            await this.storeResource(resource);
+
+            await this.monitor.recordMetric({
+                name: 'resource_deallocated',
+                value: 1,
+                labels: {
+                    resource_id: resourceId,
+                    type: resource.type,
+                    name: resource.name
+                }
             });
 
         } catch (error) {
@@ -172,163 +252,365 @@ export class ResourceManagementService {
         }
     }
 
-    async reserveResources(
-        type: ResourceConfig['type'],
-        quantity: number,
-        priority: ResourceConfig['priority'],
-        duration: number
-    ): Promise<ResourceReservation> {
+    async getResource(resourceId: string): Promise<ResourceAllocation | null> {
+        // Check memory cache
+        if (this.resources.has(resourceId)) {
+            return this.resources.get(resourceId)!;
+        }
+
+        // Query database
+        const [rows] = await this.bigquery.query({
+            query: `
+                SELECT *
+                FROM \`resources.allocations\`
+                WHERE id = @resourceId
+            `,
+            params: { resourceId }
+        });
+
+        return rows[0] ? this.deserializeResource(rows[0]) : null;
+    }
+
+    async updateResourceConfig(
+        resourceId: string,
+        updates: Partial<ResourceConfig>
+    ): Promise<void> {
         try {
-            const pool = this.findPoolByType(type);
-            if (!pool) {
-                throw new Error(`No pool available for type: ${type}`);
+            const resource = await this.getResource(resourceId);
+            if (!resource) {
+                throw new Error(`Resource not found: ${resourceId}`);
             }
 
-            // Check if reservation is possible
-            if (!this.canReserveResources(pool, quantity)) {
-                throw new Error('Insufficient resources for reservation');
-            }
+            // Validate updates
+            await this.validateResourceConfig({ ...resource.config, ...updates });
 
-            const reservation: ResourceReservation = {
-                id: this.generateReservationId(),
-                resourceType: type,
-                quantity,
-                priority,
-                expiresAt: new Date(Date.now() + duration)
-            };
+            // Apply updates
+            resource.config = { ...resource.config, ...updates };
+            resource.metadata.updatedAt = new Date();
 
-            pool.reservations.set(reservation.id, reservation);
+            // Update infrastructure
+            await this.updateResourceInfrastructure(resource);
+
+            // Store updated resource
+            await this.storeResource(resource);
 
             await this.monitor.recordMetric({
-                name: 'resource_reservation',
-                value: quantity,
+                name: 'resource_updated',
+                value: 1,
                 labels: {
-                    type,
-                    priority,
-                    pool_id: pool.id
+                    resource_id: resourceId,
+                    type: resource.type
                 }
             });
 
-            return reservation;
-
         } catch (error) {
-            await this.handleError('resource_reservation_error', error);
+            await this.handleError('resource_update_error', error);
             throw error;
         }
     }
 
-    private async initializeResourcePools(): Promise<void> {
-        // Create default pools for each resource type
-        const types: ResourceConfig['type'][] = ['compute', 'memory', 'storage', 'gpu'];
-        
-        for (const type of types) {
-            const pool: ResourcePool = {
-                id: `pool-${type}`,
-                resources: new Map(),
-                totalCapacity: { compute: 0, memory: 0, storage: 0, gpu: 0 },
-                availableCapacity: { compute: 0, memory: 0, storage: 0, gpu: 0 },
-                reservations: new Map()
-            };
-            
-            this.pools.set(pool.id, pool);
+    private async provisionResource(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        switch (resource.type) {
+            case 'compute-instance':
+                await this.provisionComputeInstance(resource);
+                break;
+            case 'gke-node':
+                await this.provisionGKENode(resource);
+                break;
+            case 'cloud-function':
+                await this.provisionCloudFunction(resource);
+                break;
+            case 'cloud-run':
+                await this.provisionCloudRun(resource);
+                break;
+            default:
+                throw new Error(`Unsupported resource type: ${resource.type}`);
         }
     }
 
-    private async findSuitablePool(config: ResourceConfig): Promise<ResourcePool | null> {
-        // Implementation for finding suitable resource pool
-        return this.pools.get(`pool-${config.type}`) || null;
+    private async provisionComputeInstance(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        const zone = this.compute.zone('us-central1-a');
+        const [instance] = await zone.createVM({
+            name: resource.name,
+            machineType: this.getMachineType(resource.config.spec),
+            disks: [{
+                boot: true,
+                autoDelete: true,
+                initializeParams: {
+                    sourceImage: 'projects/debian-cloud/global/images/debian-10',
+                    diskSizeGb: resource.config.spec.disk.size,
+                    diskType: resource.config.spec.disk.type
+                }
+            }],
+            networkInterfaces: [{
+                network: 'global/networks/default',
+                accessConfigs: resource.config.networking.internal ? [] : [{
+                    name: 'External NAT'
+                }]
+            }],
+            serviceAccounts: [{
+                email: resource.config.security.serviceAccount,
+                scopes: ['https://www.googleapis.com/auth/cloud-platform']
+            }],
+            labels: resource.config.security.labels,
+            confidentialInstanceConfig: resource.config.security.confidential ? {
+                enableConfidentialCompute: true
+            } : undefined
+        });
+
+        // Wait for instance to be running
+        await instance.waitFor('RUNNING');
     }
 
-    private hasCapacity(pool: ResourcePool, config: ResourceConfig): boolean {
-        return pool.availableCapacity[config.type] >= config.quantity;
+    private async provisionGKENode(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        // Implement GKE node provisioning
     }
 
-    private async scalePool(pool: ResourcePool, config: ResourceConfig): Promise<void> {
-        // Implementation for scaling resource pool
+    private async provisionCloudFunction(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        // Implement Cloud Function provisioning
     }
 
-    private async createResource(pool: ResourcePool, config: ResourceConfig): Promise<Resource> {
-        const resource: Resource = {
-            id: this.generateResourceId(),
-            type: config.type,
-            status: 'provisioning',
-            config,
-            metrics: {
-                utilization: 0,
-                cost: 0,
-                performance: 0
-            },
+    private async provisionCloudRun(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        // Implement Cloud Run provisioning
+    }
+
+    private async deprovisionResource(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        switch (resource.type) {
+            case 'compute-instance':
+                await this.deprovisionComputeInstance(resource);
+                break;
+            case 'gke-node':
+                await this.deprovisionGKENode(resource);
+                break;
+            case 'cloud-function':
+                await this.deprovisionCloudFunction(resource);
+                break;
+            case 'cloud-run':
+                await this.deprovisionCloudRun(resource);
+                break;
+        }
+    }
+
+    private async deprovisionComputeInstance(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        const zone = this.compute.zone('us-central1-a');
+        const vm = zone.vm(resource.name);
+        await vm.delete();
+    }
+
+    private getMachineType(spec: ResourceConfig['spec']): string {
+        const cpu = spec.cpu;
+        const memory = spec.memory;
+        return `n1-standard-${cpu}`;
+    }
+
+    private calculateHourlyRate(config: ResourceConfig): number {
+        // Implement cost calculation based on resource configuration
+        return 0.0;
+    }
+
+    private async validateResourceConfig(
+        config: Partial<ResourceConfig>
+    ): Promise<void> {
+        if (!config.type || !config.spec) {
+            throw new Error('Invalid resource configuration');
+        }
+
+        // Validate resource limits
+        if (config.spec.cpu < 1 || config.spec.memory < 1) {
+            throw new Error('Invalid resource specifications');
+        }
+
+        // Validate networking
+        if (config.networking?.ports?.some(p => p < 1 || p > 65535)) {
+            throw new Error('Invalid port configuration');
+        }
+    }
+
+    private async updateResourceInfrastructure(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        // Implement infrastructure updates
+    }
+
+    private async collectResourceMetrics(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        // Implement metrics collection
+    }
+
+    private async updateResourceCosts(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        const now = new Date();
+        const hours = (now.getTime() - resource.costs.lastBilled.getTime()) / 3600000;
+        resource.costs.totalCost += hours * resource.costs.hourlyRate;
+        resource.costs.lastBilled = now;
+    }
+
+    private startHealthChecks(): void {
+        setInterval(async () => {
+            for (const resource of this.resources.values()) {
+                try {
+                    await this.checkResourceHealth(resource);
+                } catch (error) {
+                    await this.handleError('health_check_error', error);
+                }
+            }
+        }, this.HEALTH_CHECK_INTERVAL);
+    }
+
+    private async checkResourceHealth(
+        resource: ResourceAllocation
+    ): Promise<void> {
+        // Implement health checks
+    }
+
+    private startMetricsCollection(): void {
+        setInterval(async () => {
+            for (const resource of this.resources.values()) {
+                try {
+                    await this.collectResourceMetrics(resource);
+                } catch (error) {
+                    await this.handleError('metrics_collection_error', error);
+                }
+            }
+        }, this.METRICS_UPDATE_INTERVAL);
+    }
+
+    private startCostTracking(): void {
+        setInterval(async () => {
+            for (const resource of this.resources.values()) {
+                try {
+                    await this.updateResourceCosts(resource);
+                } catch (error) {
+                    await this.handleError('cost_tracking_error', error);
+                }
+            }
+        }, this.COST_UPDATE_INTERVAL);
+    }
+
+    private async storeResource(resource: ResourceAllocation): Promise<void> {
+        await this.bigquery
+            .dataset('resources')
+            .table('allocations')
+            .insert([this.formatResourceForStorage(resource)]);
+    }
+
+    private formatResourceForStorage(resource: ResourceAllocation): Record<string, any> {
+        return {
+            ...resource,
+            config: JSON.stringify(resource.config),
             metadata: {
-                createdAt: new Date(),
-                lastUpdated: new Date()
+                ...resource.metadata,
+                createdAt: resource.metadata.createdAt.toISOString(),
+                updatedAt: resource.metadata.updatedAt.toISOString(),
+                expiresAt: resource.metadata.expiresAt?.toISOString(),
+                lastHealthCheck: resource.metadata.lastHealthCheck?.toISOString()
+            },
+            metrics: JSON.stringify(resource.metrics),
+            costs: {
+                ...resource.costs,
+                lastBilled: resource.costs.lastBilled.toISOString()
             }
         };
-
-        pool.resources.set(resource.id, resource);
-        return resource;
     }
 
-    private updatePoolCapacity(pool: ResourcePool, resource: Resource, action: 'allocate' | 'deallocate'): void {
-        const modifier = action === 'allocate' ? -1 : 1;
-        pool.availableCapacity[resource.type] += resource.config.quantity * modifier;
-    }
-
-    private async findResource(resourceId: string): Promise<[ResourcePool, Resource | undefined]> {
-        for (const pool of this.pools.values()) {
-            const resource = pool.resources.get(resourceId);
-            if (resource) {
-                return [pool, resource];
+    private deserializeResource(row: any): ResourceAllocation {
+        return {
+            ...row,
+            config: JSON.parse(row.config),
+            metadata: {
+                ...row.metadata,
+                createdAt: new Date(row.metadata.createdAt),
+                updatedAt: new Date(row.metadata.updatedAt),
+                expiresAt: row.metadata.expiresAt ? new Date(row.metadata.expiresAt) : undefined,
+                lastHealthCheck: row.metadata.lastHealthCheck ? new Date(row.metadata.lastHealthCheck) : undefined
+            },
+            metrics: JSON.parse(row.metrics),
+            costs: {
+                ...row.costs,
+                lastBilled: new Date(row.costs.lastBilled)
             }
-        }
-        return [this.pools.values().next().value, undefined];
+        };
     }
 
-    private findPoolByType(type: ResourceConfig['type']): ResourcePool | undefined {
-        return this.pools.get(`pool-${type}`);
-    }
+    private async setupInfrastructure(): Promise<void> {
+        const dataset = this.bigquery.dataset('resources');
+        const [exists] = await dataset.exists();
 
-    private canReserveResources(pool: ResourcePool, quantity: number): boolean {
-        // Implementation for checking resource reservation possibility
-        return pool.availableCapacity[pool.id.split('-')[1] as ResourceConfig['type']] >= quantity;
-    }
-
-    private startResourceMonitoring(): void {
-        setInterval(async () => {
-            try {
-                await this.monitorResources();
-            } catch (error) {
-                await this.handleError('resource_monitoring_error', error);
-            }
-        }, 60000); // Every minute
-    }
-
-    private async monitorResources(): Promise<void> {
-        for (const pool of this.pools.values()) {
-            for (const resource of pool.resources.values()) {
-                await this.updateResourceMetrics(resource);
-                await this.checkResourceHealth(resource);
-            }
+        if (!exists) {
+            await dataset.create();
+            await this.createResourceTables(dataset);
         }
     }
 
-    private async updateResourceMetrics(resource: Resource): Promise<void> {
-        // Implementation for updating resource metrics
+    private async createResourceTables(dataset: any): Promise<void> {
+        const schema = {
+            fields: [
+                { name: 'id', type: 'STRING' },
+                { name: 'name', type: 'STRING' },
+                { name: 'type', type: 'STRING' },
+                { name: 'status', type: 'STRING' },
+                { name: 'config', type: 'JSON' },
+                { name: 'metadata', type: 'RECORD', fields: [
+                    { name: 'createdAt', type: 'TIMESTAMP' },
+                    { name: 'updatedAt', type: 'TIMESTAMP' },
+                    { name: 'expiresAt', type: 'TIMESTAMP' },
+                    { name: 'lastHealthCheck', type: 'TIMESTAMP' }
+                ]},
+                { name: 'metrics', type: 'JSON' },
+                { name: 'costs', type: 'RECORD', fields: [
+                    { name: 'hourlyRate', type: 'FLOAT' },
+                    { name: 'totalCost', type: 'FLOAT' },
+                    { name: 'lastBilled', type: 'TIMESTAMP' }
+                ]}
+            ]
+        };
+
+        await dataset.createTable('allocations', { schema });
     }
 
-    private async checkResourceHealth(resource: Resource): Promise<void> {
-        // Implementation for checking resource health
+    private async loadExistingResources(): Promise<void> {
+        const [rows] = await this.bigquery.query(`
+            SELECT *
+            FROM \`resources.allocations\`
+            WHERE status != 'stopped'
+        `);
+
+        for (const row of rows) {
+            const resource = this.deserializeResource(row);
+            this.resources.set(resource.id, resource);
+        }
     }
 
-    private async cleanupResource(resource: Resource): Promise<void> {
-        // Implementation for resource cleanup
+    private setupEventListeners(): void {
+        this.eventBus.subscribe({
+            id: 'resource-monitor',
+            topic: 'system.status',
+            handler: async (event) => {
+                if (event.data.status === 'critical') {
+                    await this.handleCriticalSystemStatus();
+                }
+            }
+        });
     }
 
-    private generateResourceId(): string {
-        return `res-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    }
-
-    private generateReservationId(): string {
-        return `rsv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    private async handleCriticalSystemStatus(): Promise<void> {
+        // Implement critical system status handling
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
@@ -336,6 +618,19 @@ export class ResourceManagementService {
             name: type,
             value: 1,
             labels: { error: error.message }
+        });
+
+        await this.eventBus.publish('resource.error', {
+            type: 'resource.error',
+            source: 'resource-management',
+            data: {
+                error: error.message,
+                timestamp: new Date()
+            },
+            metadata: {
+                severity: 'high',
+                environment: process.env.NODE_ENV || 'development'
+            }
         });
     }
 }

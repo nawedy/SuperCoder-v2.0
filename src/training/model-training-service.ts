@@ -1,143 +1,208 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
-import { ResourceManagementService } from '../resources/resource-management-service';
-import { SecurityConfig } from '../config/security-config';
+import { EventBusService } from '../events/event-bus-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
-import { DataProcessingService } from '../data/data-processing-service';
-import { ModelRegistryService } from '../registry/model-registry-service';
+import { PrivacyRulesEngine } from '../privacy/privacy-rules-engine';
+import { SecurityScanner } from '../security/security-scanner';
+import { ModelRegistryService } from '../models/model-registry-service';
+import { CloudStorage } from '@google-cloud/storage';
+import { v4 as uuidv4 } from 'uuid';
 
 interface TrainingConfig {
-    modelType: 'transformer' | 'lstm' | 'gpt';
-    hyperparameters: {
-        learningRate: number;
-        batchSize: number;
-        epochs: number;
-        architecture: {
-            layers: number;
-            hiddenSize: number;
-            attentionHeads?: number;
-        };
+    modelId: string;
+    version: string;
+    hyperparameters: Record<string, any>;
+    resources: {
+        gpuCount: number;
+        memoryGB: number;
+        timeoutMinutes: number;
     };
-    distributed: {
-        enabled: boolean;
-        strategy: 'data-parallel' | 'model-parallel';
-        nodes: number;
+    security: {
+        enableEncryption: boolean;
+        enablePrivacyChecks: boolean;
+        auditFrequency: number;
+    };
+    validation: {
+        splitRatio: number;
+        metrics: string[];
+        thresholds: Record<string, number>;
     };
     checkpointing: {
         enabled: boolean;
         frequency: number;
         maxCheckpoints: number;
     };
-    monitoring: {
-        metrics: string[];
-        frequency: number;
-    };
 }
 
 interface TrainingJob {
     id: string;
-    status: 'preparing' | 'training' | 'validating' | 'completed' | 'failed';
+    modelId: string;
+    version: string;
+    status: TrainingStatus;
     config: TrainingConfig;
     metrics: {
-        loss: number;
-        accuracy: number;
-        epochsCompleted: number;
+        currentEpoch: number;
+        totalEpochs: number;
+        currentLoss: number;
+        validationMetrics: Record<string, number>;
         timeElapsed: number;
-        resourceUtilization: {
-            cpu: number;
-            memory: number;
-            gpu: number;
+        resourceUsage: {
+            gpuUtilization: number;
+            memoryUsage: number;
+            cpuUsage: number;
+        };
+    };
+    security: {
+        privacyChecks: {
+            passed: boolean;
+            findings: string[];
+        };
+        vulnerabilities: {
+            found: boolean;
+            details: string[];
         };
     };
     checkpoints: {
-        path: string;
-        epoch: number;
-        metrics: Record<string, number>;
-    }[];
+        current: number;
+        locations: string[];
+        metrics: Record<string, number>[];
+    };
+    metadata: {
+        startTime: Date;
+        endTime?: Date;
+        lastUpdateTime: Date;
+        failureReason?: string;
+    };
 }
+
+type TrainingStatus = 
+    | 'pending'
+    | 'preparing'
+    | 'training'
+    | 'validating'
+    | 'completing'
+    | 'completed'
+    | 'failed'
+    | 'stopped';
 
 export class ModelTrainingService {
     private monitor: MonitoringService;
-    private resources: ResourceManagementService;
-    private security: SecurityConfig;
+    private eventBus: EventBusService;
     private audit: AuditTrailService;
-    private dataProcessor: DataProcessingService;
+    private privacy: PrivacyRulesEngine;
+    private security: SecurityScanner;
     private registry: ModelRegistryService;
+    private storage: CloudStorage;
     private activeJobs: Map<string, TrainingJob>;
+    private readonly METRIC_UPDATE_INTERVAL = 10000; // 10 seconds
+    private readonly CHECKPOINT_STORAGE: string;
 
     constructor(
         monitor: MonitoringService,
-        resources: ResourceManagementService,
-        security: SecurityConfig,
+        eventBus: EventBusService,
         audit: AuditTrailService,
-        dataProcessor: DataProcessingService,
-        registry: ModelRegistryService
+        privacy: PrivacyRulesEngine,
+        security: SecurityScanner,
+        registry: ModelRegistryService,
+        config: {
+            projectId: string;
+        }
     ) {
         this.monitor = monitor;
-        this.resources = resources;
-        this.security = security;
+        this.eventBus = eventBus;
         this.audit = audit;
-        this.dataProcessor = dataProcessor;
+        this.privacy = privacy;
+        this.security = security;
         this.registry = registry;
+        this.storage = new CloudStorage({ projectId: config.projectId });
         this.activeJobs = new Map();
+        this.CHECKPOINT_STORAGE = `${config.projectId}-model-checkpoints`;
+
+        this.initialize();
+    }
+
+    private async initialize(): Promise<void> {
+        await this.setupInfrastructure();
+        this.startMetricsCollection();
+        this.setupEventListeners();
     }
 
     async startTraining(
-        datasetId: string,
+        modelId: string,
         config: TrainingConfig
     ): Promise<string> {
-        const jobId = this.generateJobId();
-        
+        const startTime = Date.now();
         try {
             // Validate configuration
-            await this.validateConfig(config);
+            await this.validateTrainingConfig(config);
 
-            // Initialize training job
+            // Perform privacy checks if enabled
+            if (config.security.enablePrivacyChecks) {
+                await this.performPrivacyChecks(modelId);
+            }
+
+            // Create training job
+            const jobId = uuidv4();
             const job: TrainingJob = {
                 id: jobId,
-                status: 'preparing',
+                modelId,
+                version: config.version,
+                status: 'pending',
                 config,
                 metrics: {
-                    loss: 0,
-                    accuracy: 0,
-                    epochsCompleted: 0,
+                    currentEpoch: 0,
+                    totalEpochs: config.hyperparameters.epochs || 1,
+                    currentLoss: 0,
+                    validationMetrics: {},
                     timeElapsed: 0,
-                    resourceUtilization: {
-                        cpu: 0,
-                        memory: 0,
-                        gpu: 0
+                    resourceUsage: {
+                        gpuUtilization: 0,
+                        memoryUsage: 0,
+                        cpuUsage: 0
                     }
                 },
-                checkpoints: []
+                security: {
+                    privacyChecks: {
+                        passed: true,
+                        findings: []
+                    },
+                    vulnerabilities: {
+                        found: false,
+                        details: []
+                    }
+                },
+                checkpoints: {
+                    current: 0,
+                    locations: [],
+                    metrics: []
+                },
+                metadata: {
+                    startTime: new Date(),
+                    lastUpdateTime: new Date()
+                }
             };
 
+            // Store job and start training
             this.activeJobs.set(jobId, job);
+            await this.startTrainingJob(job);
 
-            // Request resources
-            const resources = await this.resources.allocateResources({
-                type: 'gpu',
-                size: 'large',
-                quantity: config.distributed.enabled ? config.distributed.nodes : 1,
-                priority: 'high',
-                tags: ['training'],
-                autoScale: {
-                    enabled: true,
-                    minInstances: 1,
-                    maxInstances: config.distributed.nodes,
-                    targetUtilization: 0.8
+            // Record metrics
+            await this.monitor.recordMetric({
+                name: 'training_job_started',
+                value: Date.now() - startTime,
+                labels: {
+                    model_id: modelId,
+                    version: config.version,
+                    job_id: jobId
                 }
             });
 
-            // Start training process
-            this.executeTraining(jobId, datasetId, resources.id).catch(error => {
-                this.handleTrainingError(jobId, error);
-            });
-
+            // Audit log
             await this.audit.logEvent({
                 eventType: 'model.train',
                 actor: {
                     id: 'system',
                     type: 'service',
-                    metadata: { jobId }
+                    metadata: {}
                 },
                 resource: {
                     type: 'training-job',
@@ -150,13 +215,52 @@ export class ModelTrainingService {
                     userAgent: 'system'
                 },
                 status: 'success',
-                details: { config }
+                details: {
+                    model_id: modelId,
+                    version: config.version,
+                    gpu_count: config.resources.gpuCount
+                }
             });
 
             return jobId;
 
         } catch (error) {
             await this.handleError('training_start_error', error);
+            throw error;
+        }
+    }
+
+    async stopTraining(jobId: string): Promise<void> {
+        try {
+            const job = this.activeJobs.get(jobId);
+            if (!job) {
+                throw new Error(`Training job not found: ${jobId}`);
+            }
+
+            // Stop training process
+            await this.stopTrainingJob(job);
+
+            // Update job status
+            job.status = 'stopped';
+            job.metadata.endTime = new Date();
+
+            // Save final checkpoint if enabled
+            if (job.config.checkpointing.enabled) {
+                await this.saveCheckpoint(job);
+            }
+
+            await this.monitor.recordMetric({
+                name: 'training_job_stopped',
+                value: 1,
+                labels: {
+                    model_id: job.modelId,
+                    version: job.version,
+                    job_id: jobId
+                }
+            });
+
+        } catch (error) {
+            await this.handleError('training_stop_error', error);
             throw error;
         }
     }
@@ -169,171 +273,183 @@ export class ModelTrainingService {
         return job;
     }
 
-    async stopTraining(jobId: string): Promise<void> {
+    private async startTrainingJob(job: TrainingJob): Promise<void> {
         try {
-            const job = this.activeJobs.get(jobId);
-            if (!job) {
-                throw new Error(`Training job not found: ${jobId}`);
+            job.status = 'preparing';
+
+            // Initialize training environment
+            await this.initializeTraining(job);
+
+            // Start training process
+            job.status = 'training';
+            await this.runTrainingLoop(job);
+
+            // Validate results
+            job.status = 'validating';
+            const validationPassed = await this.validateResults(job);
+
+            if (validationPassed) {
+                // Complete training
+                job.status = 'completing';
+                await this.completeTraining(job);
+                job.status = 'completed';
+            } else {
+                throw new Error('Validation failed');
             }
 
-            // Gracefully stop training
-            await this.gracefulStop(job);
-
-            // Release resources
-            await this.resources.deallocateResource(jobId);
-
-            await this.audit.logEvent({
-                eventType: 'model.train',
-                actor: {
-                    id: 'system',
-                    type: 'service',
-                    metadata: { jobId }
-                },
-                resource: {
-                    type: 'training-job',
-                    id: jobId,
-                    action: 'stop'
-                },
-                context: {
-                    location: 'model-training',
-                    ipAddress: 'internal',
-                    userAgent: 'system'
-                },
-                status: 'success',
-                details: { final_metrics: job.metrics }
-            });
-
         } catch (error) {
-            await this.handleError('training_stop_error', error);
+            job.status = 'failed';
+            job.metadata.failureReason = error.message;
             throw error;
+        } finally {
+            job.metadata.endTime = new Date();
         }
     }
 
-    private async executeTraining(
-        jobId: string,
-        datasetId: string,
-        resourceId: string
-    ): Promise<void> {
-        const job = this.activeJobs.get(jobId)!;
-        const startTime = Date.now();
+    private async initializeTraining(job: TrainingJob): Promise<void> {
+        // Initialize training environment
+        // This would typically involve setting up distributed training,
+        // allocating GPUs, etc.
+    }
 
-        try {
-            job.status = 'training';
+    private async runTrainingLoop(job: TrainingJob): Promise<void> {
+        // Implement training loop
+        // This would typically involve the actual model training process
+        // with regular metric updates and checkpointing
+    }
 
-            // Process dataset
-            const processedData = await this.dataProcessor.processDataset(
-                datasetId,
-                {
-                    type: 'training',
-                    format: 'parquet',
-                    validation: {
-                        schema: {},
-                        rules: []
-                    },
-                    transformation: {
-                        steps: [],
-                        parallelProcessing: true
-                    },
-                    output: {
-                        format: 'parquet',
-                        compression: 'snappy'
+    private async validateResults(job: TrainingJob): Promise<boolean> {
+        // Check if metrics meet thresholds
+        for (const [metric, threshold] of Object.entries(job.config.validation.thresholds)) {
+            const value = job.metrics.validationMetrics[metric];
+            if (value === undefined || value < threshold) {
+                return false;
+            }
+        }
+
+        // Perform security scan
+        const securityScan = await this.security.scanModel(
+            [], // Model artifacts would go here
+            {} // Model config would go here
+        );
+
+        job.security.vulnerabilities = {
+            found: securityScan.vulnerabilities.length > 0,
+            details: securityScan.vulnerabilities.map(v => v.description)
+        };
+
+        return !job.security.vulnerabilities.found;
+    }
+
+    private async completeTraining(job: TrainingJob): Promise<void> {
+        // Save final model state
+        await this.saveCheckpoint(job);
+
+        // Register model version
+        await this.registry.registerVersion(
+            job.modelId,
+            [], // Model artifacts would go here
+            {
+                framework: 'tensorflow', // This should come from actual config
+                architecture: 'transformer', // This should come from actual config
+                hyperparameters: job.config.hyperparameters,
+                dependencies: [] // Dependencies would go here
+            },
+            job.version
+        );
+    }
+
+    private async saveCheckpoint(job: TrainingJob): Promise<void> {
+        const checkpointPath = `${job.modelId}/${job.version}/checkpoint-${job.checkpoints.current}`;
+        const file = this.storage
+            .bucket(this.CHECKPOINT_STORAGE)
+            .file(checkpointPath);
+
+        // Save checkpoint data
+        // This would typically involve saving model weights and optimizer state
+
+        job.checkpoints.locations.push(checkpointPath);
+        job.checkpoints.current++;
+    }
+
+    private async performPrivacyChecks(modelId: string): Promise<void> {
+        // Implement privacy checks using PrivacyRulesEngine
+    }
+
+    private async validateTrainingConfig(config: TrainingConfig): Promise<void> {
+        if (!config.modelId || !config.version) {
+            throw new Error('Invalid training configuration');
+        }
+
+        // Validate resources
+        if (config.resources.gpuCount < 0 || 
+            config.resources.memoryGB < 1 ||
+            config.resources.timeoutMinutes < 1) {
+            throw new Error('Invalid resource configuration');
+        }
+
+        // Validate hyperparameters
+        if (!config.hyperparameters.epochs || 
+            config.hyperparameters.epochs < 1) {
+            throw new Error('Invalid hyperparameters');
+        }
+    }
+
+    private async stopTrainingJob(job: TrainingJob): Promise<void> {
+        // Implement training stop logic
+        // This would typically involve gracefully stopping distributed training
+    }
+
+    private startMetricsCollection(): void {
+        setInterval(async () => {
+            for (const job of this.activeJobs.values()) {
+                if (job.status === 'training') {
+                    try {
+                        const metrics = await this.collectMetrics(job);
+                        this.updateJobMetrics(job, metrics);
+                    } catch (error) {
+                        await this.handleError('metrics_collection_error', error);
                     }
                 }
-            );
+            }
+        }, this.METRIC_UPDATE_INTERVAL);
+    }
 
-            // Train model (implementation depends on your ML framework)
-            await this.trainModel(job, processedData.output.path);
+    private async collectMetrics(job: TrainingJob): Promise<Partial<TrainingJob['metrics']>> {
+        // Implement metrics collection
+        return {};
+    }
 
-            // Validate model
-            job.status = 'validating';
-            await this.validateModel(job);
+    private updateJobMetrics(
+        job: TrainingJob,
+        metrics: Partial<TrainingJob['metrics']>
+    ): void {
+        job.metrics = {
+            ...job.metrics,
+            ...metrics
+        };
+        job.metadata.lastUpdateTime = new Date();
+    }
 
-            // Save model
-            const modelId = await this.registry.registerModel(
-                Buffer.from(''), // Model data
-                {
-                    name: `model-${jobId}`,
-                    version: '1.0.0',
-                    type: job.config.modelType,
-                    metrics: job.metrics
-                }
-            );
+    private async setupInfrastructure(): Promise<void> {
+        // Create checkpoint storage bucket
+        const [exists] = await this.storage
+            .bucket(this.CHECKPOINT_STORAGE)
+            .exists();
 
-            job.status = 'completed';
-            job.metrics.timeElapsed = Date.now() - startTime;
-
-            await this.monitor.recordMetric({
-                name: 'training_completed',
-                value: job.metrics.timeElapsed,
-                labels: {
-                    job_id: jobId,
-                    model_type: job.config.modelType
-                }
-            });
-
-        } catch (error) {
-            await this.handleTrainingError(jobId, error);
-            throw error;
+        if (!exists) {
+            await this.storage.createBucket(this.CHECKPOINT_STORAGE);
         }
     }
 
-    private async trainModel(job: TrainingJob, dataPath: string): Promise<void> {
-        // Implementation for model training
-        // This would integrate with your ML framework (TensorFlow, PyTorch, etc.)
-    }
-
-    private async validateModel(job: TrainingJob): Promise<void> {
-        // Implementation for model validation
-    }
-
-    private async gracefulStop(job: TrainingJob): Promise<void> {
-        // Implementation for graceful training stop
-    }
-
-    private async validateConfig(config: TrainingConfig): Promise<void> {
-        if (config.hyperparameters.learningRate <= 0) {
-            throw new Error('Learning rate must be positive');
-        }
-
-        if (config.distributed.enabled && config.distributed.nodes < 2) {
-            throw new Error('Distributed training requires at least 2 nodes');
-        }
-
-        // Add more validation rules
-    }
-
-    private async handleTrainingError(jobId: string, error: Error): Promise<void> {
-        const job = this.activeJobs.get(jobId);
-        if (job) {
-            job.status = 'failed';
-        }
-
-        await this.audit.logEvent({
-            eventType: 'model.train',
-            actor: {
-                id: 'system',
-                type: 'service',
-                metadata: { jobId }
-            },
-            resource: {
-                type: 'training-job',
-                id: jobId,
-                action: 'error'
-            },
-            context: {
-                location: 'model-training',
-                ipAddress: 'internal',
-                userAgent: 'system'
-            },
-            status: 'failure',
-            details: { error: error.message }
+    private setupEventListeners(): void {
+        this.eventBus.subscribe({
+            id: 'training-monitor',
+            topic: 'model.train.stop',
+            handler: async (event) => {
+                await this.stopTraining(event.data.jobId);
+            }
         });
-
-        await this.handleError('training_execution_error', error);
-    }
-
-    private generateJobId(): string {
-        return `train-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
@@ -341,6 +457,19 @@ export class ModelTrainingService {
             name: type,
             value: 1,
             labels: { error: error.message }
+        });
+
+        await this.eventBus.publish('training.error', {
+            type: 'training.error',
+            source: 'model-training',
+            data: {
+                error: error.message,
+                timestamp: new Date()
+            },
+            metadata: {
+                severity: 'high',
+                environment: process.env.NODE_ENV || 'development'
+            }
         });
     }
 }
