@@ -1,167 +1,207 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
+import { EventBusService } from '../events/event-bus-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
 import { SecurityConfig } from '../config/security-config';
 import { BigQuery } from '@google-cloud/bigquery';
-import { CloudDLP } from '@google-cloud/dlp';
-
-interface ComplianceRule {
-    id: string;
-    name: string;
-    description: string;
-    framework: 'GDPR' | 'HIPAA' | 'SOC2' | 'CCPA';
-    category: 'privacy' | 'security' | 'data-governance' | 'access-control';
-    validator: (data: any, context: ComplianceContext) => Promise<boolean>;
-    remediation?: string;
-    severity: 'critical' | 'high' | 'medium' | 'low';
-}
-
-interface ComplianceContext {
-    environment: string;
-    dataType: string;
-    region: string;
-    owner: string;
-    metadata: Record<string, any>;
-}
+import { PubSub } from '@google-cloud/pubsub';
+import { v4 as uuidv4 } from 'uuid';
 
 interface ComplianceCheck {
     id: string;
-    timestamp: Date;
-    rule: ComplianceRule;
-    status: 'compliant' | 'non-compliant';
-    evidence: {
-        description: string;
-        data: any;
+    type: ComplianceType;
+    name: string;
+    description: string;
+    requirements: ComplianceRequirement[];
+    schedule: {
+        frequency: 'hourly' | 'daily' | 'weekly' | 'monthly';
+        lastRun?: Date;
+        nextRun: Date;
     };
-    context: ComplianceContext;
+    enabled: boolean;
+}
+
+interface ComplianceRequirement {
+    id: string;
+    name: string;
+    description: string;
+    validation: {
+        type: 'policy' | 'data' | 'security' | 'privacy';
+        rules: ValidationRule[];
+    };
+    remediation?: {
+        automatic: boolean;
+        steps: string[];
+        script?: string;
+    };
+}
+
+interface ValidationRule {
+    condition: string;
+    expected: any;
+    severity: 'critical' | 'high' | 'medium' | 'low';
+    action?: 'alert' | 'block' | 'log';
 }
 
 interface ComplianceReport {
     id: string;
+    checkId: string;
     timestamp: Date;
-    framework: ComplianceRule['framework'];
-    checks: ComplianceCheck[];
-    summary: {
-        total: number;
-        compliant: number;
-        nonCompliant: number;
-        criticalIssues: number;
-    };
+    status: 'compliant' | 'non-compliant' | 'warning';
+    findings: ComplianceFinding[];
     metadata: {
-        generatedBy: string;
-        environment: string;
-        version: string;
+        duration: number;
+        itemsChecked: number;
+        itemsViolated: number;
+    };
+    summary: {
+        critical: number;
+        high: number;
+        medium: number;
+        low: number;
     };
 }
 
+interface ComplianceFinding {
+    id: string;
+    requirement: string;
+    severity: ValidationRule['severity'];
+    description: string;
+    evidence: {
+        type: string;
+        data: any;
+        location?: string;
+    };
+    status: 'open' | 'resolved' | 'accepted';
+    remediation?: {
+        plan: string;
+        status: 'pending' | 'in-progress' | 'completed';
+        appliedAt?: Date;
+    };
+}
+
+type ComplianceType = 
+    | 'GDPR'
+    | 'HIPAA'
+    | 'SOC2'
+    | 'ISO27001'
+    | 'CCPA'
+    | 'CustomPolicy';
+
 export class ComplianceService {
     private monitor: MonitoringService;
+    private eventBus: EventBusService;
     private audit: AuditTrailService;
     private security: SecurityConfig;
     private bigquery: BigQuery;
-    private dlp: CloudDLP;
-    private rules: Map<string, ComplianceRule>;
+    private pubsub: PubSub;
+    private checks: Map<string, ComplianceCheck>;
+    private readonly SCAN_INTERVAL = 3600000; // 1 hour
 
     constructor(
         monitor: MonitoringService,
+        eventBus: EventBusService,
         audit: AuditTrailService,
         security: SecurityConfig,
-        projectId: string
+        config: {
+            projectId: string;
+        }
     ) {
         this.monitor = monitor;
+        this.eventBus = eventBus;
         this.audit = audit;
         this.security = security;
-        this.bigquery = new BigQuery({ projectId });
-        this.dlp = new CloudDLP({ projectId });
-        this.rules = this.initializeRules();
+        this.bigquery = new BigQuery({ projectId: config.projectId });
+        this.pubsub = new PubSub({ projectId: config.projectId });
+        this.checks = new Map();
+
+        this.initialize();
     }
 
-    private initializeRules(): Map<string, ComplianceRule> {
-        const rules = new Map<string, ComplianceRule>();
-
-        // GDPR Data Protection Rules
-        rules.set('GDPR-001', {
-            id: 'GDPR-001',
-            name: 'Personal Data Protection',
-            description: 'Ensures personal data is processed lawfully, fairly, and transparently',
-            framework: 'GDPR',
-            category: 'privacy',
-            severity: 'critical',
-            validator: async (data, context) => {
-                // Implement GDPR data protection validation
-                const findings = await this.dlp.inspectContent({
-                    parent: `projects/${this.dlp.projectId}`,
-                    inspectConfig: {
-                        infoTypes: [
-                            { name: 'EMAIL_ADDRESS' },
-                            { name: 'PHONE_NUMBER' },
-                            { name: 'CREDIT_CARD_NUMBER' }
-                        ]
-                    },
-                    item: { value: JSON.stringify(data) }
-                });
-
-                return findings[0].result.findings.length === 0;
-            },
-            remediation: 'Implement data encryption and access controls'
-        });
-
-        // HIPAA Security Rules
-        rules.set('HIPAA-001', {
-            id: 'HIPAA-001',
-            name: 'PHI Access Control',
-            description: 'Ensures Protected Health Information (PHI) is properly secured',
-            framework: 'HIPAA',
-            category: 'security',
-            severity: 'critical',
-            validator: async (data, context) => {
-                // Implement HIPAA compliance validation
-                return true;
-            },
-            remediation: 'Implement encryption and access logging for PHI'
-        });
-
-        // Add more compliance rules...
-
-        return rules;
+    private async initialize(): Promise<void> {
+        await this.setupInfrastructure();
+        await this.loadComplianceChecks();
+        this.startComplianceMonitor();
+        this.setupEventListeners();
     }
 
-    async performComplianceCheck(
-        data: any,
-        context: ComplianceContext
+    async runComplianceCheck(
+        checkId: string,
+        context?: Record<string, any>
     ): Promise<ComplianceReport> {
         const startTime = Date.now();
-        const checks: ComplianceCheck[] = [];
-
         try {
-            // Execute all applicable rules
-            for (const rule of this.rules.values()) {
-                const check = await this.executeRule(rule, data, context);
-                checks.push(check);
+            // Get compliance check
+            const check = this.checks.get(checkId);
+            if (!check) {
+                throw new Error(`Compliance check not found: ${checkId}`);
+            }
 
-                await this.monitor.recordMetric({
-                    name: 'compliance_check',
-                    value: check.status === 'compliant' ? 1 : 0,
-                    labels: {
-                        rule_id: rule.id,
-                        framework: rule.framework,
-                        severity: rule.severity
-                    }
+            // Initialize report
+            const report: ComplianceReport = {
+                id: uuidv4(),
+                checkId,
+                timestamp: new Date(),
+                status: 'compliant',
+                findings: [],
+                metadata: {
+                    duration: 0,
+                    itemsChecked: 0,
+                    itemsViolated: 0
+                },
+                summary: {
+                    critical: 0,
+                    high: 0,
+                    medium: 0,
+                    low: 0
+                }
+            };
+
+            // Execute requirements
+            for (const requirement of check.requirements) {
+                const findings = await this.evaluateRequirement(requirement, context);
+                report.findings.push(...findings);
+                report.metadata.itemsViolated += findings.length;
+
+                // Update summary
+                findings.forEach(finding => {
+                    report.summary[finding.severity]++;
                 });
             }
 
-            // Generate report
-            const report = this.generateReport(checks, context);
+            // Update metadata
+            report.metadata.duration = Date.now() - startTime;
+            report.status = this.determineComplianceStatus(report);
 
+            // Store report
+            await this.storeComplianceReport(report);
+
+            // Update check schedule
+            check.schedule.lastRun = new Date();
+            check.schedule.nextRun = this.calculateNextRun(check.schedule);
+            await this.updateComplianceCheck(check);
+
+            // Record metrics
+            await this.monitor.recordMetric({
+                name: 'compliance_check_completed',
+                value: report.metadata.duration,
+                labels: {
+                    check_id: checkId,
+                    status: report.status,
+                    violations: report.metadata.itemsViolated.toString()
+                }
+            });
+
+            // Audit log
             await this.audit.logEvent({
-                eventType: 'system.config',
+                eventType: 'compliance.check',
                 actor: {
-                    id: context.owner,
-                    type: 'user',
+                    id: 'system',
+                    type: 'service',
                     metadata: {}
                 },
                 resource: {
                     type: 'compliance-check',
-                    id: report.id,
+                    id: checkId,
                     action: 'execute'
                 },
                 context: {
@@ -169,15 +209,13 @@ export class ComplianceService {
                     ipAddress: 'internal',
                     userAgent: 'system'
                 },
-                status: report.summary.nonCompliant === 0 ? 'success' : 'failure',
+                status: report.status === 'compliant' ? 'success' : 'failure',
                 details: {
-                    summary: report.summary,
-                    duration: Date.now() - startTime
+                    type: check.type,
+                    findings: report.findings.length,
+                    critical: report.summary.critical
                 }
             });
-
-            // Store report
-            await this.storeReport(report);
 
             return report;
 
@@ -187,80 +225,266 @@ export class ComplianceService {
         }
     }
 
-    private async executeRule(
-        rule: ComplianceRule,
-        data: any,
-        context: ComplianceContext
-    ): Promise<ComplianceCheck> {
+    async addComplianceCheck(check: Omit<ComplianceCheck, 'id'>): Promise<string> {
         try {
-            const isCompliant = await rule.validator(data, context);
+            // Validate check configuration
+            await this.validateCheckConfig(check);
 
-            return {
-                id: this.generateCheckId(),
-                timestamp: new Date(),
-                rule,
-                status: isCompliant ? 'compliant' : 'non-compliant',
-                evidence: {
-                    description: `Compliance check for ${rule.name}`,
-                    data: { isCompliant }
-                },
-                context
+            // Create check
+            const checkId = uuidv4();
+            const newCheck: ComplianceCheck = {
+                ...check,
+                id: checkId,
+                schedule: {
+                    ...check.schedule,
+                    nextRun: this.calculateNextRun(check.schedule)
+                }
             };
+
+            // Store check
+            await this.storeComplianceCheck(newCheck);
+            this.checks.set(checkId, newCheck);
+
+            return checkId;
+
         } catch (error) {
-            await this.handleError('rule_execution_error', error);
+            await this.handleError('compliance_check_creation_error', error);
             throw error;
         }
     }
 
-    private generateReport(
-        checks: ComplianceCheck[],
-        context: ComplianceContext
-    ): ComplianceReport {
-        const summary = {
-            total: checks.length,
-            compliant: checks.filter(c => c.status === 'compliant').length,
-            nonCompliant: checks.filter(c => c.status === 'non-compliant').length,
-            criticalIssues: checks.filter(c => 
-                c.status === 'non-compliant' && 
-                c.rule.severity === 'critical'
-            ).length
-        };
+    private async evaluateRequirement(
+        requirement: ComplianceRequirement,
+        context?: Record<string, any>
+    ): Promise<ComplianceFinding[]> {
+        const findings: ComplianceFinding[] = [];
 
-        return {
-            id: this.generateReportId(),
-            timestamp: new Date(),
-            framework: 'GDPR', // Could be dynamic based on context
-            checks,
-            summary,
-            metadata: {
-                generatedBy: context.owner,
-                environment: context.environment,
-                version: '1.0.0'
+        try {
+            for (const rule of requirement.validation.rules) {
+                const result = await this.evaluateRule(rule, requirement, context);
+                if (result) {
+                    findings.push(result);
+                }
             }
+        } catch (error) {
+            await this.handleError('requirement_evaluation_error', error);
+        }
+
+        return findings;
+    }
+
+    private async evaluateRule(
+        rule: ValidationRule,
+        requirement: ComplianceRequirement,
+        context?: Record<string, any>
+    ): Promise<ComplianceFinding | null> {
+        // Evaluate rule condition
+        const violation = await this.checkRuleViolation(rule, context);
+        if (!violation) return null;
+
+        // Create finding
+        return {
+            id: uuidv4(),
+            requirement: requirement.id,
+            severity: rule.severity,
+            description: `Violation of ${requirement.name}: ${violation.reason}`,
+            evidence: {
+                type: requirement.validation.type,
+                data: violation.data
+            },
+            status: 'open',
+            remediation: requirement.remediation?.automatic ? {
+                plan: requirement.remediation.steps.join('\n'),
+                status: 'pending'
+            } : undefined
         };
     }
 
-    private async storeReport(report: ComplianceReport): Promise<void> {
+    private async checkRuleViolation(
+        rule: ValidationRule,
+        context?: Record<string, any>
+    ): Promise<{ reason: string; data: any } | null> {
+        // Implement rule violation checking
+        return null;
+    }
+
+    private determineComplianceStatus(report: ComplianceReport): ComplianceReport['status'] {
+        if (report.summary.critical > 0) {
+            return 'non-compliant';
+        }
+        if (report.summary.high > 0 || report.summary.medium > 0) {
+            return 'warning';
+        }
+        return 'compliant';
+    }
+
+    private calculateNextRun(schedule: ComplianceCheck['schedule']): Date {
+        const now = new Date();
+        switch (schedule.frequency) {
+            case 'hourly':
+                return new Date(now.getTime() + 3600000);
+            case 'daily':
+                return new Date(now.setDate(now.getDate() + 1));
+            case 'weekly':
+                return new Date(now.setDate(now.getDate() + 7));
+            case 'monthly':
+                return new Date(now.setMonth(now.getMonth() + 1));
+            default:
+                return new Date(now.setDate(now.getDate() + 1));
+        }
+    }
+
+    private startComplianceMonitor(): void {
+        setInterval(async () => {
+            const now = new Date();
+            for (const check of this.checks.values()) {
+                if (check.enabled && check.schedule.nextRun <= now) {
+                    try {
+                        await this.runComplianceCheck(check.id);
+                    } catch (error) {
+                        await this.handleError('scheduled_check_error', error);
+                    }
+                }
+            }
+        }, this.SCAN_INTERVAL);
+    }
+
+    private async validateCheckConfig(check: Partial<ComplianceCheck>): Promise<void> {
+        if (!check.type || !check.name || !check.requirements?.length) {
+            throw new Error('Invalid compliance check configuration');
+        }
+
+        // Validate requirements
+        for (const requirement of check.requirements) {
+            if (!requirement.validation?.rules?.length) {
+                throw new Error(`Invalid requirement configuration: ${requirement.name}`);
+            }
+        }
+    }
+
+    private async setupInfrastructure(): Promise<void> {
+        const dataset = this.bigquery.dataset('compliance');
+        const [exists] = await dataset.exists();
+
+        if (!exists) {
+            await dataset.create();
+            await this.createComplianceTables(dataset);
+        }
+    }
+
+    private async createComplianceTables(dataset: any): Promise<void> {
+        const tables = {
+            checks: {
+                fields: [
+                    { name: 'id', type: 'STRING' },
+                    { name: 'type', type: 'STRING' },
+                    { name: 'name', type: 'STRING' },
+                    { name: 'description', type: 'STRING' },
+                    { name: 'requirements', type: 'JSON' },
+                    { name: 'schedule', type: 'JSON' },
+                    { name: 'enabled', type: 'BOOLEAN' }
+                ]
+            },
+            reports: {
+                fields: [
+                    { name: 'id', type: 'STRING' },
+                    { name: 'checkId', type: 'STRING' },
+                    { name: 'timestamp', type: 'TIMESTAMP' },
+                    { name: 'status', type: 'STRING' },
+                    { name: 'findings', type: 'JSON' },
+                    { name: 'metadata', type: 'JSON' },
+                    { name: 'summary', type: 'JSON' }
+                ]
+            }
+        };
+
+        for (const [name, schema] of Object.entries(tables)) {
+            await dataset.createTable(name, { schema });
+        }
+    }
+
+    private async loadComplianceChecks(): Promise<void> {
+        const [rows] = await this.bigquery.query(`
+            SELECT *
+            FROM \`compliance.checks\`
+            WHERE enabled = true
+        `);
+
+        for (const row of rows) {
+            const check = this.deserializeCheck(row);
+            this.checks.set(check.id, check);
+        }
+    }
+
+    private async storeComplianceCheck(check: ComplianceCheck): Promise<void> {
+        await this.bigquery
+            .dataset('compliance')
+            .table('checks')
+            .insert([this.formatCheckForStorage(check)]);
+    }
+
+    private async updateComplianceCheck(check: ComplianceCheck): Promise<void> {
+        this.checks.set(check.id, check);
+        await this.storeComplianceCheck(check);
+    }
+
+    private async storeComplianceReport(report: ComplianceReport): Promise<void> {
         await this.bigquery
             .dataset('compliance')
             .table('reports')
             .insert([this.formatReportForStorage(report)]);
     }
 
-    private formatReportForStorage(report: ComplianceReport): any {
+    private formatCheckForStorage(check: ComplianceCheck): Record<string, any> {
         return {
-            ...report,
-            timestamp: report.timestamp.toISOString(),
-            checks: JSON.stringify(report.checks)
+            ...check,
+            requirements: JSON.stringify(check.requirements),
+            schedule: JSON.stringify(check.schedule)
         };
     }
 
-    private generateCheckId(): string {
-        return `check-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    private formatReportForStorage(report: ComplianceReport): Record<string, any> {
+        return {
+            ...report,
+            timestamp: report.timestamp.toISOString(),
+            findings: JSON.stringify(report.findings),
+            metadata: JSON.stringify(report.metadata),
+            summary: JSON.stringify(report.summary)
+        };
     }
 
-    private generateReportId(): string {
-        return `report-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    private deserializeCheck(row: any): ComplianceCheck {
+        return {
+            ...row,
+            requirements: JSON.parse(row.requirements),
+            schedule: JSON.parse(row.schedule)
+        };
+    }
+
+    private setupEventListeners(): void {
+        this.eventBus.subscribe({
+            id: 'compliance-monitor',
+            topic: 'security.alert',
+            handler: async (event) => {
+                if (event.data.type === 'security_violation') {
+                    await this.handleSecurityViolation(event.data);
+                }
+            }
+        });
+    }
+
+    private async handleSecurityViolation(data: any): Promise<void> {
+        // Trigger immediate compliance check for security-related requirements
+        const securityChecks = Array.from(this.checks.values())
+            .filter(check => check.type === 'SOC2' || check.type === 'ISO27001');
+
+        for (const check of securityChecks) {
+            try {
+                await this.runComplianceCheck(check.id, { violationContext: data });
+            } catch (error) {
+                await this.handleError('security_violation_check_error', error);
+            }
+        }
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
@@ -268,6 +492,19 @@ export class ComplianceService {
             name: type,
             value: 1,
             labels: { error: error.message }
+        });
+
+        await this.eventBus.publish('compliance.error', {
+            type: 'compliance.error',
+            source: 'compliance-service',
+            data: {
+                error: error.message,
+                timestamp: new Date()
+            },
+            metadata: {
+                severity: 'high',
+                environment: process.env.NODE_ENV || 'development'
+            }
         });
     }
 }

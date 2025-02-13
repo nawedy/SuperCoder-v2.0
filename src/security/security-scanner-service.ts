@@ -1,21 +1,27 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
 import { EventBusService } from '../events/event-bus-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
-import { CodeAnalysisService } from '../analysis/code-analysis-service';
+import { CloudSecurityCommand } from '@google-cloud/security-command-center';
+import { CloudDLP } from '@google-cloud/dlp';
 import { v4 as uuidv4 } from 'uuid';
 
-interface SecurityScan {
+interface SecurityScanResult {
     id: string;
     timestamp: Date;
     target: {
-        type: 'code' | 'model' | 'data';
+        type: 'code' | 'model' | 'data' | 'config';
         id: string;
-        version?: string;
+        hash: string;
     };
     status: ScanStatus;
     vulnerabilities: Vulnerability[];
-    metrics: SecurityMetrics;
-    configuration: ScanConfig;
+    score: number;
+    metadata: {
+        duration: number;
+        rulesChecked: number;
+        issuesFound: number;
+    };
+    compliance: ComplianceResult[];
 }
 
 interface Vulnerability {
@@ -24,159 +30,153 @@ interface Vulnerability {
     severity: 'critical' | 'high' | 'medium' | 'low';
     description: string;
     location?: {
-        file: string;
+        file?: string;
         line?: number;
-        column?: number;
+        snippet?: string;
     };
-    codeSnippet?: string;
-    cveId?: string;
+    cwe?: string;
+    cvss?: number;
     remediation?: string;
-    confidence: number;
-    metadata: Record<string, any>;
 }
 
-interface SecurityMetrics {
-    overallScore: number;
-    criticalCount: number;
-    highCount: number;
-    mediumCount: number;
-    lowCount: number;
-    falsePositives: number;
-    scanDuration: number;
-    policyCompliance: {
-        passed: number;
-        failed: number;
-        rules: string[];
-    };
+interface ComplianceResult {
+    standard: string;
+    control: string;
+    status: 'passed' | 'failed' | 'warning';
+    details: string;
 }
 
 interface ScanConfig {
     rules: SecurityRule[];
-    ignorePatterns: string[];
-    customPolicies: SecurityPolicy[];
     thresholds: {
         maxCritical: number;
         maxHigh: number;
-        minOverallScore: number;
+        minScore: number;
     };
+    compliance: string[];
 }
 
 interface SecurityRule {
     id: string;
+    name: string;
     type: VulnerabilityType;
-    pattern: string | RegExp;
-    severity: 'critical' | 'high' | 'medium' | 'low';
+    pattern: RegExp | string;
+    severity: Vulnerability['severity'];
     description: string;
     remediation?: string;
-    enabled: boolean;
 }
 
-interface SecurityPolicy {
-    id: string;
-    name: string;
-    rules: string[];
-    action: 'block' | 'warn' | 'audit';
-    threshold: number;
-}
-
+type ScanStatus = 'pending' | 'scanning' | 'completed' | 'failed';
 type VulnerabilityType = 
-    | 'code_injection'
-    | 'sql_injection'
+    | 'injection'
     | 'xss'
-    | 'authentication_bypass'
-    | 'authorization_bypass'
-    | 'sensitive_data_exposure'
-    | 'insecure_configuration'
-    | 'dependency_vulnerability'
+    | 'authentication'
+    | 'exposure'
+    | 'misconfiguration'
+    | 'sensitive-data'
+    | 'dependency'
     | 'custom';
-
-type ScanStatus = 'queued' | 'running' | 'completed' | 'failed';
 
 export class SecurityScannerService {
     private monitor: MonitoringService;
     private eventBus: EventBusService;
     private audit: AuditTrailService;
-    private codeAnalysis: CodeAnalysisService;
-    private activeScans: Map<string, SecurityScan>;
+    private securityCommand: CloudSecurityCommand;
+    private dlp: CloudDLP;
     private rules: Map<string, SecurityRule>;
-    private policies: Map<string, SecurityPolicy>;
+    private activeScanners: Map<string, ScanStatus>;
     private readonly SCAN_TIMEOUT = 300000; // 5 minutes
 
     constructor(
         monitor: MonitoringService,
         eventBus: EventBusService,
         audit: AuditTrailService,
-        codeAnalysis: CodeAnalysisService
+        config: {
+            projectId: string;
+        }
     ) {
         this.monitor = monitor;
         this.eventBus = eventBus;
         this.audit = audit;
-        this.codeAnalysis = codeAnalysis;
-        this.activeScans = new Map();
+        this.securityCommand = new CloudSecurityCommand({
+            projectId: config.projectId
+        });
+        this.dlp = new CloudDLP();
         this.rules = new Map();
-        this.policies = new Map();
+        this.activeScanners = new Map();
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
         await this.loadSecurityRules();
-        await this.loadSecurityPolicies();
         this.setupEventListeners();
     }
 
     async scanCode(
         code: string,
         config?: Partial<ScanConfig>
-    ): Promise<SecurityScan> {
+    ): Promise<SecurityScanResult> {
         const startTime = Date.now();
-        try {
-            const scanId = uuidv4();
-            const scanConfig = this.createScanConfig(config);
+        const scanId = uuidv4();
 
-            // Create initial scan record
-            const scan: SecurityScan = {
+        try {
+            // Initialize scan
+            this.activeScanners.set(scanId, 'pending');
+            const codeHash = await this.calculateHash(code);
+
+            // Create scan result
+            const result: SecurityScanResult = {
                 id: scanId,
                 timestamp: new Date(),
                 target: {
                     type: 'code',
-                    id: scanId
+                    id: scanId,
+                    hash: codeHash
                 },
-                status: 'running',
+                status: 'scanning',
                 vulnerabilities: [],
-                metrics: this.initializeMetrics(),
-                configuration: scanConfig
+                score: 100,
+                metadata: {
+                    duration: 0,
+                    rulesChecked: 0,
+                    issuesFound: 0
+                },
+                compliance: []
             };
 
-            this.activeScans.set(scanId, scan);
+            // Start scanning
+            this.activeScanners.set(scanId, 'scanning');
 
-            // Start security scan
-            const vulnerabilities = await this.performSecurityScan(code, scanConfig);
-            
-            // Update metrics
-            scan.metrics = this.calculateMetrics(vulnerabilities);
-            scan.vulnerabilities = vulnerabilities;
-            scan.status = 'completed';
-            scan.metrics.scanDuration = Date.now() - startTime;
+            // Perform security checks
+            await this.performSecurityChecks(code, result, config);
 
-            // Check policy compliance
-            const compliance = await this.checkPolicyCompliance(scan);
-            scan.metrics.policyCompliance = compliance;
+            // Calculate security score
+            result.score = this.calculateSecurityScore(result.vulnerabilities);
+
+            // Check compliance
+            if (config?.compliance) {
+                result.compliance = await this.checkCompliance(code, config.compliance);
+            }
+
+            // Update status and metadata
+            result.status = 'completed';
+            result.metadata.duration = Date.now() - startTime;
 
             // Record metrics
             await this.monitor.recordMetric({
-                name: 'security_scan',
-                value: scan.metrics.scanDuration,
+                name: 'security_scan_completed',
+                value: result.metadata.duration,
                 labels: {
                     scan_id: scanId,
-                    vulnerabilities: vulnerabilities.length.toString(),
-                    critical: scan.metrics.criticalCount.toString()
+                    vulnerabilities: result.vulnerabilities.length.toString(),
+                    score: result.score.toString()
                 }
             });
 
             // Audit log
             await this.audit.logEvent({
-                eventType: 'security.alert',
+                eventType: 'security.scan',
                 actor: {
                     id: 'system',
                     type: 'service',
@@ -185,7 +185,7 @@ export class SecurityScannerService {
                 resource: {
                     type: 'security-scan',
                     id: scanId,
-                    action: 'complete'
+                    action: 'scan'
                 },
                 context: {
                     location: 'security-scanner',
@@ -194,15 +194,19 @@ export class SecurityScannerService {
                 },
                 status: 'success',
                 details: {
-                    metrics: scan.metrics,
-                    critical_vulnerabilities: scan.metrics.criticalCount
+                    score: result.score,
+                    issues: result.vulnerabilities.length
                 }
             });
 
-            return scan;
+            // Clean up
+            this.activeScanners.delete(scanId);
+
+            return result;
 
         } catch (error) {
-            await this.handleError('scan_error', error);
+            this.activeScanners.delete(scanId);
+            await this.handleError('security_scan_error', error);
             throw error;
         }
     }
@@ -212,17 +216,19 @@ export class SecurityScannerService {
             // Validate rule
             await this.validateSecurityRule(rule);
 
-            const id = uuidv4();
+            // Create rule
+            const ruleId = uuidv4();
             const newRule: SecurityRule = {
                 ...rule,
-                id,
-                enabled: true
+                id: ruleId
             };
 
-            this.rules.set(id, newRule);
+            // Store rule
+            this.rules.set(ruleId, newRule);
 
+            // Audit log
             await this.audit.logEvent({
-                eventType: 'security.alert',
+                eventType: 'security.config',
                 actor: {
                     id: 'system',
                     type: 'service',
@@ -230,7 +236,7 @@ export class SecurityScannerService {
                 },
                 resource: {
                     type: 'security-rule',
-                    id,
+                    id: ruleId,
                     action: 'create'
                 },
                 context: {
@@ -242,7 +248,7 @@ export class SecurityScannerService {
                 details: { rule: newRule }
             });
 
-            return id;
+            return ruleId;
 
         } catch (error) {
             await this.handleError('rule_creation_error', error);
@@ -250,289 +256,207 @@ export class SecurityScannerService {
         }
     }
 
-    private async performSecurityScan(
+    private async performSecurityChecks(
         code: string,
-        config: ScanConfig
-    ): Promise<Vulnerability[]> {
-        const vulnerabilities: Vulnerability[] = [];
+        result: SecurityScanResult,
+        config?: Partial<ScanConfig>
+    ): Promise<void> {
+        // Get applicable rules
+        const rules = config?.rules || Array.from(this.rules.values());
+        result.metadata.rulesChecked = rules.length;
 
-        // Perform code analysis
-        const analysisResult = await this.codeAnalysis.analyzeCode(code, 'scan.ts');
+        // Check for vulnerabilities
+        const checkPromises = rules.map(rule => this.checkVulnerability(code, rule));
+        const vulnerabilities = (await Promise.all(checkPromises))
+            .filter(v => v !== null) as Vulnerability[];
 
-        // Apply security rules
-        for (const rule of config.rules) {
-            if (!rule.enabled) continue;
+        result.vulnerabilities = vulnerabilities;
+        result.metadata.issuesFound = vulnerabilities.length;
 
-            const matches = await this.applySecurityRule(code, rule);
-            vulnerabilities.push(...matches);
-        }
+        // Check thresholds
+        this.checkVulnerabilityThresholds(
+            vulnerabilities,
+            config?.thresholds
+        );
 
-        // Check for known vulnerabilities in dependencies
-        const dependencyVulnerabilities = await this.scanDependencies(code);
-        vulnerabilities.push(...dependencyVulnerabilities);
-
-        // Remove duplicates and false positives
-        return this.filterVulnerabilities(vulnerabilities, config.ignorePatterns);
+        // Scan for sensitive data
+        await this.scanForSensitiveData(code, result);
     }
 
-    private async applySecurityRule(
+    private async checkVulnerability(
         code: string,
         rule: SecurityRule
-    ): Promise<Vulnerability[]> {
-        const vulnerabilities: Vulnerability[] = [];
-        let matches: RegExpMatchArray | null;
+    ): Promise<Vulnerability | null> {
+        try {
+            let matches: RegExpMatchArray | null;
+            const pattern = rule.pattern instanceof RegExp 
+                ? rule.pattern 
+                : new RegExp(rule.pattern);
 
-        if (rule.pattern instanceof RegExp) {
-            matches = code.match(rule.pattern);
-        } else {
-            matches = code.match(new RegExp(rule.pattern, 'g'));
-        }
-
-        if (matches) {
-            for (const match of matches) {
-                const location = this.findCodeLocation(code, match);
-                vulnerabilities.push({
+            if (matches = code.match(pattern)) {
+                return {
                     id: uuidv4(),
                     type: rule.type,
                     severity: rule.severity,
                     description: rule.description,
-                    location,
-                    codeSnippet: this.extractCodeSnippet(code, location),
-                    remediation: rule.remediation,
-                    confidence: 0.8,
-                    metadata: {
-                        ruleId: rule.id,
-                        pattern: rule.pattern.toString()
-                    }
-                });
+                    location: {
+                        snippet: matches[0],
+                        line: this.findLineNumber(code, matches.index!)
+                    },
+                    remediation: rule.remediation
+                };
+            }
+
+            return null;
+
+        } catch (error) {
+            await this.handleError('vulnerability_check_error', error);
+            return null;
+        }
+    }
+
+    private async scanForSensitiveData(
+        code: string,
+        result: SecurityScanResult
+    ): Promise<void> {
+        try {
+            const [dlpResponse] = await this.dlp.inspectContent({
+                parent: this.dlp.projectPath('-'),
+                inspectConfig: {
+                    infoTypes: [
+                        { name: 'API_KEY' },
+                        { name: 'ENCRYPTION_KEY' },
+                        { name: 'PASSWORD' },
+                        { name: 'CREDENTIALS' }
+                    ],
+                    minLikelihood: 'POSSIBLE',
+                    includeQuote: true
+                },
+                item: { value: code }
+            });
+
+            if (dlpResponse.result?.findings) {
+                for (const finding of dlpResponse.result.findings) {
+                    result.vulnerabilities.push({
+                        id: uuidv4(),
+                        type: 'sensitive-data',
+                        severity: 'high',
+                        description: `Sensitive data found: ${finding.infoType?.name}`,
+                        location: {
+                            snippet: finding.quote || undefined,
+                            line: this.findLineNumber(code, finding.location?.byteRange?.start || 0)
+                        },
+                        remediation: 'Remove or encrypt sensitive data'
+                    });
+                }
+            }
+        } catch (error) {
+            await this.handleError('sensitive_data_scan_error', error);
+        }
+    }
+
+    private checkVulnerabilityThresholds(
+        vulnerabilities: Vulnerability[],
+        thresholds?: ScanConfig['thresholds']
+    ): void {
+        if (!thresholds) return;
+
+        const criticalCount = vulnerabilities.filter(v => v.severity === 'critical').length;
+        const highCount = vulnerabilities.filter(v => v.severity === 'high').length;
+
+        if (criticalCount > thresholds.maxCritical) {
+            throw new Error(`Too many critical vulnerabilities: ${criticalCount}`);
+        }
+
+        if (highCount > thresholds.maxHigh) {
+            throw new Error(`Too many high vulnerabilities: ${highCount}`);
+        }
+    }
+
+    private async checkCompliance(
+        code: string,
+        standards: string[]
+    ): Promise<ComplianceResult[]> {
+        const results: ComplianceResult[] = [];
+
+        for (const standard of standards) {
+            switch (standard) {
+                case 'owasp-top-10':
+                    results.push(...await this.checkOWASPCompliance(code));
+                    break;
+                case 'pci-dss':
+                    results.push(...await this.checkPCIDSSCompliance(code));
+                    break;
+                // Add more compliance standards
             }
         }
 
-        return vulnerabilities;
+        return results;
     }
 
-    private async scanDependencies(code: string): Promise<Vulnerability[]> {
-        const vulnerabilities: Vulnerability[] = [];
-
-        // Extract dependencies from code
-        const dependencies = this.extractDependencies(code);
-
-        // Check each dependency against vulnerability databases
-        for (const dep of dependencies) {
-            const vulns = await this.checkDependencyVulnerabilities(dep);
-            vulnerabilities.push(...vulns);
-        }
-
-        return vulnerabilities;
-    }
-
-    private extractDependencies(code: string): string[] {
-        const imports = code.match(/import.*from\s+['"](.+)['"]/g) || [];
-        const requires = code.match(/require\(['"](.+)['"]\)/g) || [];
-
-        return [...imports, ...requires].map(dep => {
-            const match = dep.match(/['"](.+)['"]/);
-            return match ? match[1] : '';
-        });
-    }
-
-    private async checkDependencyVulnerabilities(
-        dependency: string
-    ): Promise<Vulnerability[]> {
-        // Implementation would typically involve checking against vulnerability databases
+    private async checkOWASPCompliance(code: string): Promise<ComplianceResult[]> {
+        // Implement OWASP Top 10 compliance checks
         return [];
     }
 
-    private findCodeLocation(
-        code: string,
-        match: string
-    ): NonNullable<Vulnerability['location']> {
-        const index = code.indexOf(match);
-        const lines = code.slice(0, index).split('\n');
-        
-        return {
-            file: 'scan.ts',
-            line: lines.length,
-            column: lines[lines.length - 1].length + 1
-        };
+    private async checkPCIDSSCompliance(code: string): Promise<ComplianceResult[]> {
+        // Implement PCI DSS compliance checks
+        return [];
     }
 
-    private extractCodeSnippet(
-        code: string,
-        location: NonNullable<Vulnerability['location']>
-    ): string {
-        const lines = code.split('\n');
-        const start = Math.max(0, location.line - 2);
-        const end = Math.min(lines.length, location.line + 2);
-        
-        return lines.slice(start, end).join('\n');
-    }
-
-    private filterVulnerabilities(
-        vulnerabilities: Vulnerability[],
-        ignorePatterns: string[]
-    ): Vulnerability[] {
-        return vulnerabilities.filter(vuln => {
-            // Remove duplicates
-            const isDuplicate = vulnerabilities.some(v => 
-                v.id !== vuln.id &&
-                v.type === vuln.type &&
-                v.location?.file === vuln.location?.file &&
-                v.location?.line === vuln.location?.line
-            );
-
-            // Check ignore patterns
-            const isIgnored = ignorePatterns.some(pattern => 
-                new RegExp(pattern).test(vuln.codeSnippet || '')
-            );
-
-            return !isDuplicate && !isIgnored;
-        });
-    }
-
-    private async checkPolicyCompliance(
-        scan: SecurityScan
-    ): Promise<SecurityMetrics['policyCompliance']> {
-        const compliance = {
-            passed: 0,
-            failed: 0,
-            rules: [] as string[]
+    private calculateSecurityScore(vulnerabilities: Vulnerability[]): number {
+        const weights = {
+            critical: 10,
+            high: 5,
+            medium: 2,
+            low: 1
         };
 
-        for (const policy of this.policies.values()) {
-            const relevantVulns = scan.vulnerabilities.filter(v => 
-                policy.rules.includes(v.type)
-            );
+        const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
+        let score = 100;
 
-            if (relevantVulns.length > policy.threshold) {
-                compliance.failed++;
-                compliance.rules.push(policy.id);
-
-                if (policy.action === 'block') {
-                    await this.handlePolicyViolation(scan, policy, relevantVulns);
-                }
-            } else {
-                compliance.passed++;
-            }
-        }
-
-        return compliance;
-    }
-
-    private async handlePolicyViolation(
-        scan: SecurityScan,
-        policy: SecurityPolicy,
-        violations: Vulnerability[]
-    ): Promise<void> {
-        await this.eventBus.publish('security.policy.violation', {
-            type: 'security.policy.violation',
-            source: 'security-scanner',
-            data: {
-                scanId: scan.id,
-                policyId: policy.id,
-                violations: violations.map(v => ({
-                    type: v.type,
-                    severity: v.severity,
-                    description: v.description
-                })),
-                timestamp: new Date()
-            },
-            metadata: {
-                severity: 'high',
-                environment: process.env.NODE_ENV || 'development'
-            }
-        });
-    }
-
-    private calculateMetrics(vulnerabilities: Vulnerability[]): SecurityMetrics {
-        const metrics = this.initializeMetrics();
-        
         for (const vuln of vulnerabilities) {
-            switch (vuln.severity) {
-                case 'critical':
-                    metrics.criticalCount++;
-                    break;
-                case 'high':
-                    metrics.highCount++;
-                    break;
-                case 'medium':
-                    metrics.mediumCount++;
-                    break;
-                case 'low':
-                    metrics.lowCount++;
-                    break;
-            }
+            score -= weights[vuln.severity];
         }
 
-        // Calculate overall score (0-100)
-        metrics.overallScore = Math.max(0, 100 - (
-            metrics.criticalCount * 20 +
-            metrics.highCount * 10 +
-            metrics.mediumCount * 5 +
-            metrics.lowCount * 2
-        ));
-
-        return metrics;
+        return Math.max(0, score);
     }
 
-    private initializeMetrics(): SecurityMetrics {
-        return {
-            overallScore: 100,
-            criticalCount: 0,
-            highCount: 0,
-            mediumCount: 0,
-            lowCount: 0,
-            falsePositives: 0,
-            scanDuration: 0,
-            policyCompliance: {
-                passed: 0,
-                failed: 0,
-                rules: []
-            }
-        };
-    }
-
-    private createScanConfig(
-        config?: Partial<ScanConfig>
-    ): ScanConfig {
-        return {
-            rules: Array.from(this.rules.values()),
-            ignorePatterns: config?.ignorePatterns || [],
-            customPolicies: config?.customPolicies || [],
-            thresholds: {
-                maxCritical: config?.thresholds?.maxCritical || 0,
-                maxHigh: config?.thresholds?.maxHigh || 2,
-                minOverallScore: config?.thresholds?.minOverallScore || 80
-            }
-        };
+    private findLineNumber(code: string, index: number): number {
+        return code.substring(0, index).split('\n').length;
     }
 
     private async validateSecurityRule(rule: Partial<SecurityRule>): Promise<void> {
-        if (!rule.type || !rule.pattern || !rule.severity || !rule.description) {
-            throw new Error('Missing required rule fields');
+        if (!rule.name || !rule.type || !rule.pattern || !rule.severity) {
+            throw new Error('Invalid security rule configuration');
         }
 
-        // Validate pattern
-        try {
-            new RegExp(rule.pattern);
-        } catch {
-            throw new Error('Invalid rule pattern');
+        if (rule.pattern instanceof RegExp) {
+            // Test pattern compilation
+            try {
+                new RegExp(rule.pattern.source);
+            } catch {
+                throw new Error('Invalid regular expression pattern');
+            }
         }
+    }
+
+    private async calculateHash(code: string): Promise<string> {
+        const crypto = require('crypto');
+        return crypto
+            .createHash('sha256')
+            .update(code)
+            .digest('hex');
     }
 
     private async loadSecurityRules(): Promise<void> {
-        // Implementation for loading security rules from configuration
-        // This would typically involve loading from a secure configuration store
-    }
-
-    private async loadSecurityPolicies(): Promise<void> {
-        // Implementation for loading security policies from configuration
+        // Load security rules from configuration or database
         // This would typically involve loading from a secure configuration store
     }
 
     private setupEventListeners(): void {
         this.eventBus.subscribe({
-            id: 'security-scanner-monitor',
+            id: 'security-monitor',
             topic: 'code.update',
             handler: async (event) => {
                 await this.scanCode(event.data.code);

@@ -268,3 +268,302 @@ export class MonitoringService {
             metric: metric.name,
             value: metric.value,
             timestamp: new Date(),
+            labels: { ...config.labels, ...metric.labels }
+        };
+
+        // Publish alert
+        await this.pubsub
+            .topic('monitoring-alerts')
+            .publish(Buffer.from(JSON.stringify(alert)));
+
+        // Store alert
+        await this.storeAlert(alert);
+
+        // Send notifications
+        await this.sendAlertNotifications(config, alert);
+    }
+
+    private async sendAlertNotifications(
+        config: AlertConfig,
+        alert: any
+    ): Promise<void> {
+        const message = this.formatAlertMessage(config, alert);
+        
+        for (const channel of config.notification.channels) {
+            try {
+                switch (channel) {
+                    case 'email':
+                        // Implement email notification
+                        break;
+                    case 'slack':
+                        // Implement Slack notification
+                        break;
+                    case 'pagerduty':
+                        // Implement PagerDuty notification
+                        break;
+                }
+            } catch (error) {
+                this.handleError('notification_error', error);
+            }
+        }
+    }
+
+    private formatAlertMessage(config: AlertConfig, alert: any): string {
+        return config.notification.message
+            .replace('${name}', alert.name)
+            .replace('${value}', alert.value)
+            .replace('${threshold}', config.condition.value);
+    }
+
+    private async checkComponentHealth(): Promise<SystemHealth['components']> {
+        const components: SystemHealth['components'] = {};
+
+        // Check each component's health
+        const checks = [
+            this.checkDatabaseHealth(),
+            this.checkAPIHealth(),
+            this.checkStorageHealth(),
+            // Add more component checks as needed
+        ];
+
+        const results = await Promise.allSettled(checks);
+        
+        results.forEach((result, index) => {
+            const componentName = ['database', 'api', 'storage'][index];
+            if (result.status === 'fulfilled') {
+                components[componentName] = result.value;
+            } else {
+                components[componentName] = {
+                    status: 'down',
+                    lastCheck: new Date(),
+                    metrics: {}
+                };
+            }
+        });
+
+        return components;
+    }
+
+    private async checkDatabaseHealth(): Promise<SystemHealth['components']['database']> {
+        // Implement database health check
+        return {
+            status: 'up',
+            lastCheck: new Date(),
+            metrics: {
+                connectionCount: 0,
+                latency: 0
+            }
+        };
+    }
+
+    private async checkAPIHealth(): Promise<SystemHealth['components']['api']> {
+        // Implement API health check
+        return {
+            status: 'up',
+            lastCheck: new Date(),
+            metrics: {
+                requestRate: 0,
+                errorRate: 0
+            }
+        };
+    }
+
+    private async checkStorageHealth(): Promise<SystemHealth['components']['storage']> {
+        // Implement storage health check
+        return {
+            status: 'up',
+            lastCheck: new Date(),
+            metrics: {
+                usedSpace: 0,
+                iops: 0
+            }
+        };
+    }
+
+    private async collectSystemMetrics(): Promise<SystemHealth['metrics']> {
+        // Collect system-wide metrics
+        return {
+            cpu: await this.getCPUUtilization(),
+            memory: await this.getMemoryUtilization(),
+            latency: await this.getAverageLatency(),
+            errorRate: await this.getErrorRate()
+        };
+    }
+
+    private async getCPUUtilization(): Promise<number> {
+        // Implement CPU utilization measurement
+        return 0;
+    }
+
+    private async getMemoryUtilization(): Promise<number> {
+        // Implement memory utilization measurement
+        return 0;
+    }
+
+    private async getAverageLatency(): Promise<number> {
+        // Implement latency measurement
+        return 0;
+    }
+
+    private async getErrorRate(): Promise<number> {
+        // Implement error rate calculation
+        return 0;
+    }
+
+    private determineOverallHealth(
+        components: SystemHealth['components'],
+        metrics: SystemHealth['metrics']
+    ): SystemHealth['status'] {
+        // Check component status
+        const componentStatus = Object.values(components).map(c => c.status);
+        if (componentStatus.includes('down')) {
+            return 'critical';
+        }
+        if (componentStatus.includes('degraded')) {
+            return 'degraded';
+        }
+
+        // Check metrics thresholds
+        if (
+            metrics.cpu > 90 ||
+            metrics.memory > 90 ||
+            metrics.errorRate > 5 ||
+            metrics.latency > 1000
+        ) {
+            return 'degraded';
+        }
+
+        return 'healthy';
+    }
+
+    private validateAlertConfig(config: AlertConfig): void {
+        if (!config.name || !config.metric || !config.condition) {
+            throw new Error('Invalid alert configuration');
+        }
+
+        if (!['threshold', 'absence', 'rate'].includes(config.condition.type)) {
+            throw new Error('Invalid condition type');
+        }
+
+        if (config.condition.duration < 0) {
+            throw new Error('Invalid duration');
+        }
+    }
+
+    private async getNotificationChannels(
+        channels: AlertConfig['notification']['channels']
+    ): Promise<string[]> {
+        // Implement notification channel lookup
+        return [];
+    }
+
+    private async setupInfrastructure(): Promise<void> {
+        const dataset = this.bigquery.dataset('monitoring');
+        const [exists] = await dataset.exists();
+
+        if (!exists) {
+            await dataset.create();
+            await this.createMonitoringTables(dataset);
+        }
+    }
+
+    private async createMonitoringTables(dataset: any): Promise<void> {
+        const tables = {
+            metrics: {
+                fields: [
+                    { name: 'name', type: 'STRING' },
+                    { name: 'value', type: 'FLOAT' },
+                    { name: 'labels', type: 'JSON' },
+                    { name: 'timestamp', type: 'TIMESTAMP' }
+                ]
+            },
+            alerts: {
+                fields: [
+                    { name: 'id', type: 'STRING' },
+                    { name: 'name', type: 'STRING' },
+                    { name: 'severity', type: 'STRING' },
+                    { name: 'metric', type: 'STRING' },
+                    { name: 'value', type: 'FLOAT' },
+                    { name: 'labels', type: 'JSON' },
+                    { name: 'timestamp', type: 'TIMESTAMP' }
+                ]
+            },
+            health: {
+                fields: [
+                    { name: 'timestamp', type: 'TIMESTAMP' },
+                    { name: 'status', type: 'STRING' },
+                    { name: 'components', type: 'JSON' },
+                    { name: 'metrics', type: 'JSON' }
+                ]
+            }
+        };
+
+        for (const [name, schema] of Object.entries(tables)) {
+            await dataset.createTable(name, { schema });
+        }
+    }
+
+    private async storeMetrics(metrics: MetricData[]): Promise<void> {
+        await this.bigquery
+            .dataset('monitoring')
+            .table('metrics')
+            .insert(metrics.map(m => ({
+                ...m,
+                labels: JSON.stringify(m.labels),
+                timestamp: m.timestamp!.toISOString()
+            })));
+    }
+
+    private async storeAlert(alert: any): Promise<void> {
+        await this.bigquery
+            .dataset('monitoring')
+            .table('alerts')
+            .insert([{
+                ...alert,
+                labels: JSON.stringify(alert.labels),
+                timestamp: alert.timestamp.toISOString()
+            }]);
+    }
+
+    private async storeAlertConfig(config: AlertConfig): Promise<void> {
+        // Store alert configuration for persistence
+    }
+
+    private async storeHealthStatus(health: SystemHealth): Promise<void> {
+        await this.bigquery
+            .dataset('monitoring')
+            .table('health')
+            .insert([{
+                timestamp: health.lastUpdated.toISOString(),
+                status: health.status,
+                components: JSON.stringify(health.components),
+                metrics: JSON.stringify(health.metrics)
+            }]);
+    }
+
+    private async loadAlertConfigs(): Promise<void> {
+        // Load alert configurations from storage
+    }
+
+    private startHealthChecks(): void {
+        setInterval(async () => {
+            try {
+                await this.getSystemHealth();
+            } catch (error) {
+                this.handleError('health_check_error', error);
+            }
+        }, this.HEALTH_CHECK_INTERVAL);
+    }
+
+    private setupMetricFlushing(): void {
+        // Ensure metrics are flushed before shutdown
+        process.on('SIGTERM', async () => {
+            await this.flushMetrics();
+        });
+    }
+
+    private handleError(type: string, error: Error): void {
+        console.error(`Monitoring error (${type}):`, error);
+        this.errorReporting.report(error);
+    }
+}

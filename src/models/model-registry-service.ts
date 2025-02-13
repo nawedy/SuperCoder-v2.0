@@ -2,210 +2,168 @@ import { MonitoringService } from '../monitoring/monitoring-service';
 import { EventBusService } from '../events/event-bus-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
 import { SecurityScanner } from '../security/security-scanner';
-import { PrivacyRulesEngine } from '../privacy/privacy-rules-engine';
 import { CloudStorage } from '@google-cloud/storage';
 import { BigQuery } from '@google-cloud/bigquery';
-import { CloudKMS } from '@google-cloud/kms';
+import { KMS } from '@google-cloud/kms';
 import { v4 as uuidv4 } from 'uuid';
 
-interface ModelVersion {
+interface ModelMetadata {
     id: string;
-    modelId: string;
-    version: string;
-    status: 'draft' | 'training' | 'validated' | 'deployed' | 'archived';
-    artifacts: ModelArtifact[];
-    metrics: ModelMetrics;
-    config: ModelConfig;
-    security: SecurityMetadata;
-    createdAt: Date;
-    updatedAt: Date;
-    deployedAt?: Date;
-}
-
-interface ModelArtifact {
-    id: string;
-    type: 'weights' | 'config' | 'checkpoint' | 'metadata';
-    format: string;
-    path: string;
-    size: number;
-    hash: string;
-    encrypted: boolean;
-}
-
-interface ModelMetrics {
-    accuracy: number;
-    loss: number;
-    latency: number;
-    memoryUsage: number;
-    gpuUsage?: number;
-    customMetrics: Record<string, number>;
-}
-
-interface ModelConfig {
+    name: string;
+    description: string;
     framework: string;
     architecture: string;
-    hyperparameters: Record<string, any>;
+    version: string;
+    status: ModelStatus;
+    creator: {
+        id: string;
+        name: string;
+        type: 'user' | 'system';
+    };
+    created: Date;
+    updated: Date;
+    tags: string[];
     dependencies: {
         name: string;
         version: string;
+        type: string;
     }[];
-}
-
-interface SecurityMetadata {
-    vulnerabilityScan: {
-        status: 'passed' | 'failed';
-        findings: SecurityFinding[];
-        lastScanned: Date;
-    };
-    encryption: {
-        enabled: boolean;
-        keyId?: string;
-        algorithm: string;
-    };
-    access: {
-        allowedUsers: string[];
-        allowedRoles: string[];
-    };
-}
-
-interface SecurityFinding {
-    type: string;
-    severity: 'critical' | 'high' | 'medium' | 'low';
-    description: string;
-    location?: string;
-    recommendation?: string;
-}
-
-interface ModelRegistryConfig {
-    storage: {
-        bucket: string;
-        path: string;
+    metrics: {
+        accuracy: number;
+        loss: number;
+        parameters: number;
+        size: number;
     };
     security: {
-        encryptionEnabled: boolean;
-        scanOnUpload: boolean;
-        requiredApprovals: number;
-    };
-    metrics: {
-        collectInterval: number;
-        retentionDays: number;
+        scanResults: SecurityScanResult;
+        encryptionStatus: 'encrypted' | 'unencrypted';
+        lastScanned: Date;
     };
 }
+
+interface SecurityScanResult {
+    score: number;
+    vulnerabilities: number;
+    criticalIssues: number;
+    lastScan: Date;
+    details: string[];
+}
+
+interface ModelVersion {
+    version: string;
+    modelId: string;
+    artifacts: {
+        weights: string;
+        config: string;
+        checkpoints?: string[];
+    };
+    metadata: ModelMetadata;
+    deployment: {
+        status: DeploymentStatus;
+        environment?: string;
+        endpoint?: string;
+    };
+}
+
+type ModelStatus = 'draft' | 'training' | 'validated' | 'deployed' | 'archived' | 'deprecated';
+type DeploymentStatus = 'pending' | 'deployed' | 'failed' | 'rolled-back';
 
 export class ModelRegistryService {
     private monitor: MonitoringService;
     private eventBus: EventBusService;
     private audit: AuditTrailService;
-    private securityScanner: SecurityScanner;
-    private privacyRules: PrivacyRulesEngine;
+    private security: SecurityScanner;
     private storage: CloudStorage;
     private bigquery: BigQuery;
-    private kms: CloudKMS;
-    private config: ModelRegistryConfig;
-    private modelVersions: Map<string, ModelVersion>;
+    private kms: KMS;
+    private models: Map<string, ModelMetadata>;
+    private versions: Map<string, ModelVersion[]>;
+    private readonly ARTIFACT_BUCKET: string;
 
     constructor(
         monitor: MonitoringService,
         eventBus: EventBusService,
         audit: AuditTrailService,
-        securityScanner: SecurityScanner,
-        privacyRules: PrivacyRulesEngine,
+        security: SecurityScanner,
         config: {
             projectId: string;
-            registryConfig: ModelRegistryConfig;
         }
     ) {
         this.monitor = monitor;
         this.eventBus = eventBus;
         this.audit = audit;
-        this.securityScanner = securityScanner;
-        this.privacyRules = privacyRules;
+        this.security = security;
         this.storage = new CloudStorage({ projectId: config.projectId });
         this.bigquery = new BigQuery({ projectId: config.projectId });
-        this.kms = new CloudKMS({ projectId: config.projectId });
-        this.config = config.registryConfig;
-        this.modelVersions = new Map();
+        this.kms = new KMS({ projectId: config.projectId });
+        this.models = new Map();
+        this.versions = new Map();
+        this.ARTIFACT_BUCKET = `${config.projectId}-model-artifacts`;
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
         await this.setupInfrastructure();
-        await this.loadExistingVersions();
-        this.startMetricsCollection();
+        await this.loadModels();
         this.setupEventListeners();
     }
 
-    async registerVersion(
-        modelId: string,
-        artifacts: Buffer[],
-        config: ModelConfig,
-        version?: string
-    ): Promise<ModelVersion> {
+    async registerModel(
+        model: Omit<ModelMetadata, 'id' | 'created' | 'updated' | 'security'>
+    ): Promise<string> {
         const startTime = Date.now();
         try {
-            // Generate version if not provided
-            const versionNumber = version || this.generateVersion(modelId);
+            // Generate model ID
+            const modelId = uuidv4();
 
-            // Validate artifacts and config
-            await this.validateArtifacts(artifacts);
-            await this.validateConfig(config);
-
-            // Process and store artifacts
-            const processedArtifacts = await this.processArtifacts(
-                modelId,
-                versionNumber,
-                artifacts
-            );
-
-            // Perform security scan if enabled
-            let securityMetadata: SecurityMetadata;
-            if (this.config.security.scanOnUpload) {
-                securityMetadata = await this.performSecurityScan(artifacts, config);
-            }
-
-            // Create version record
-            const modelVersion: ModelVersion = {
-                id: uuidv4(),
-                modelId,
-                version: versionNumber,
-                status: 'draft',
-                artifacts: processedArtifacts,
-                metrics: this.initializeMetrics(),
-                config,
-                security: securityMetadata,
-                createdAt: new Date(),
-                updatedAt: new Date()
+            // Create model metadata
+            const metadata: ModelMetadata = {
+                ...model,
+                id: modelId,
+                created: new Date(),
+                updated: new Date(),
+                security: {
+                    scanResults: {
+                        score: 0,
+                        vulnerabilities: 0,
+                        criticalIssues: 0,
+                        lastScan: new Date(),
+                        details: []
+                    },
+                    encryptionStatus: 'unencrypted',
+                    lastScanned: new Date()
+                }
             };
 
-            // Store version metadata
-            await this.storeVersionMetadata(modelVersion);
+            // Store model metadata
+            await this.storeModelMetadata(metadata);
+            this.models.set(modelId, metadata);
 
-            // Update cache
-            this.modelVersions.set(modelVersion.id, modelVersion);
+            // Initialize version tracking
+            this.versions.set(modelId, []);
 
             // Record metrics
             await this.monitor.recordMetric({
-                name: 'model_version_registered',
+                name: 'model_registered',
                 value: Date.now() - startTime,
                 labels: {
                     model_id: modelId,
-                    version: versionNumber,
-                    artifacts_count: artifacts.length.toString()
+                    framework: model.framework
                 }
             });
 
             // Audit log
             await this.audit.logEvent({
-                eventType: 'model.deploy',
+                eventType: 'model.register',
                 actor: {
-                    id: 'system',
-                    type: 'service',
+                    id: model.creator.id,
+                    type: model.creator.type,
                     metadata: {}
                 },
                 resource: {
-                    type: 'model-version',
-                    id: modelVersion.id,
+                    type: 'model',
+                    id: modelId,
                     action: 'register'
                 },
                 context: {
@@ -215,13 +173,93 @@ export class ModelRegistryService {
                 },
                 status: 'success',
                 details: {
-                    model_id: modelId,
-                    version: versionNumber,
-                    security_scan: this.config.security.scanOnUpload
+                    framework: model.framework,
+                    architecture: model.architecture
                 }
             });
 
-            return modelVersion;
+            return modelId;
+
+        } catch (error) {
+            await this.handleError('model_registration_error', error);
+            throw error;
+        }
+    }
+
+    async registerVersion(
+        modelId: string,
+        artifacts: {
+            weights: Buffer;
+            config: Buffer;
+            checkpoints?: Buffer[];
+        },
+        metadata: {
+            framework: string;
+            architecture: string;
+            hyperparameters: Record<string, any>;
+            dependencies: ModelMetadata['dependencies'];
+        },
+        version?: string
+    ): Promise<string> {
+        try {
+            // Get model
+            const model = await this.getModel(modelId);
+            if (!model) {
+                throw new Error(`Model not found: ${modelId}`);
+            }
+
+            // Generate version if not provided
+            const versionNumber = version || await this.generateVersion(modelId);
+
+            // Store artifacts
+            const artifactPaths = await this.storeArtifacts(
+                modelId,
+                versionNumber,
+                artifacts
+            );
+
+            // Create version metadata
+            const versionMetadata: ModelVersion = {
+                version: versionNumber,
+                modelId,
+                artifacts: {
+                    weights: artifactPaths.weights,
+                    config: artifactPaths.config,
+                    checkpoints: artifactPaths.checkpoints
+                },
+                metadata: {
+                    ...model,
+                    version: versionNumber,
+                    updated: new Date(),
+                    framework: metadata.framework,
+                    architecture: metadata.architecture,
+                    dependencies: metadata.dependencies,
+                    metrics: {
+                        accuracy: 0,
+                        loss: 0,
+                        parameters: 0,
+                        size: this.calculateArtifactsSize(artifacts)
+                    }
+                },
+                deployment: {
+                    status: 'pending'
+                }
+            };
+
+            // Store version
+            await this.storeVersion(versionMetadata);
+            const versions = this.versions.get(modelId) || [];
+            versions.push(versionMetadata);
+            this.versions.set(modelId, versions);
+
+            // Update model metadata
+            model.updated = new Date();
+            await this.updateModel(model);
+
+            // Run security scan
+            await this.scanVersion(modelId, versionNumber);
+
+            return versionNumber;
 
         } catch (error) {
             await this.handleError('version_registration_error', error);
@@ -229,328 +267,216 @@ export class ModelRegistryService {
         }
     }
 
-    async getVersion(versionId: string): Promise<ModelVersion | null> {
-        try {
-            // Check cache
-            if (this.modelVersions.has(versionId)) {
-                return this.modelVersions.get(versionId)!;
-            }
-
-            // Query database
-            const version = await this.loadVersionFromStore(versionId);
-            if (version) {
-                this.modelVersions.set(versionId, version);
-            }
-
-            return version;
-
-        } catch (error) {
-            await this.handleError('version_retrieval_error', error);
-            throw error;
-        }
+    async getModel(modelId: string): Promise<ModelMetadata | null> {
+        return this.models.get(modelId) || null;
     }
 
-    async updateVersionStatus(
-        versionId: string,
-        status: ModelVersion['status']
+    async getVersion(
+        modelId: string,
+        version: string
+    ): Promise<ModelVersion | null> {
+        const versions = this.versions.get(modelId) || [];
+        return versions.find(v => v.version === version) || null;
+    }
+
+    async listVersions(
+        modelId: string,
+        filter?: {
+            status?: ModelStatus;
+            from?: Date;
+            to?: Date;
+        }
+    ): Promise<ModelVersion[]> {
+        const versions = this.versions.get(modelId) || [];
+        if (!filter) return versions;
+
+        return versions.filter(version => {
+            if (filter.status && version.metadata.status !== filter.status) {
+                return false;
+            }
+            if (filter.from && version.metadata.created < filter.from) {
+                return false;
+            }
+            if (filter.to && version.metadata.created > filter.to) {
+                return false;
+            }
+            return true;
+        });
+    }
+
+    async updateModelStatus(
+        modelId: string,
+        status: ModelStatus
     ): Promise<void> {
         try {
-            const version = await this.getVersion(versionId);
-            if (!version) {
-                throw new Error(`Version not found: ${versionId}`);
+            const model = await this.getModel(modelId);
+            if (!model) {
+                throw new Error(`Model not found: ${modelId}`);
             }
 
-            // Update status
-            version.status = status;
-            version.updatedAt = new Date();
-            if (status === 'deployed') {
-                version.deployedAt = new Date();
-            }
+            model.status = status;
+            model.updated = new Date();
 
-            // Store updated version
-            await this.storeVersionMetadata(version);
+            await this.updateModel(model);
 
-            // Update cache
-            this.modelVersions.set(versionId, version);
-
-            // Publish event
             await this.eventBus.publish('model.status.updated', {
                 type: 'model.status',
                 source: 'model-registry',
                 data: {
-                    versionId,
+                    modelId,
                     status,
                     timestamp: new Date()
                 },
                 metadata: {
+                    severity: 'info',
                     environment: process.env.NODE_ENV || 'development'
                 }
             });
 
         } catch (error) {
-            await this.handleError('version_status_update_error', error);
+            await this.handleError('status_update_error', error);
             throw error;
         }
     }
 
-    async downloadArtifact(
-        versionId: string,
-        artifactId: string
-    ): Promise<Buffer> {
-        try {
-            const version = await this.getVersion(versionId);
-            if (!version) {
-                throw new Error(`Version not found: ${versionId}`);
-            }
-
-            const artifact = version.artifacts.find(a => a.id === artifactId);
-            if (!artifact) {
-                throw new Error(`Artifact not found: ${artifactId}`);
-            }
-
-            // Download from storage
-            const data = await this.downloadFromStorage(artifact.path);
-
-            // Verify integrity
-            const hash = await this.calculateHash(data);
-            if (hash !== artifact.hash) {
-                throw new Error('Artifact integrity check failed');
-            }
-
-            // Decrypt if needed
-            if (artifact.encrypted) {
-                return await this.decryptArtifact(
-                    data,
-                    version.security.encryption.keyId!
-                );
-            }
-
-            return data;
-
-        } catch (error) {
-            await this.handleError('artifact_download_error', error);
-            throw error;
-        }
+    private async generateVersion(modelId: string): Promise<string> {
+        const versions = this.versions.get(modelId) || [];
+        const latestVersion = versions
+            .map(v => parseInt(v.version))
+            .sort((a, b) => b - a)[0] || 0;
+        return (latestVersion + 1).toString();
     }
 
-    private async processArtifacts(
+    private async storeArtifacts(
         modelId: string,
         version: string,
-        artifacts: Buffer[]
-    ): Promise<ModelArtifact[]> {
-        const processed: ModelArtifact[] = [];
-
-        for (let i = 0; i < artifacts.length; i++) {
-            const artifact = artifacts[i];
-            const id = uuidv4();
-            const path = this.buildArtifactPath(modelId, version, id);
-            const hash = await this.calculateHash(artifact);
-
-            // Encrypt if enabled
-            let processedData = artifact;
-            let encrypted = false;
-            if (this.config.security.encryptionEnabled) {
-                processedData = await this.encryptArtifact(artifact);
-                encrypted = true;
-            }
-
-            // Upload to storage
-            await this.uploadToStorage(path, processedData);
-
-            processed.push({
-                id,
-                type: 'weights', // This should be determined based on artifact content
-                format: 'pb', // This should be determined based on artifact content
-                path,
-                size: artifact.length,
-                hash,
-                encrypted
-            });
+        artifacts: {
+            weights: Buffer;
+            config: Buffer;
+            checkpoints?: Buffer[];
         }
+    ): Promise<{
+        weights: string;
+        config: string;
+        checkpoints?: string[];
+    }> {
+        const bucket = this.storage.bucket(this.ARTIFACT_BUCKET);
+        const basePath = `${modelId}/${version}`;
 
-        return processed;
-    }
+        // Store weights
+        const weightsPath = `${basePath}/weights.h5`;
+        await bucket.file(weightsPath).save(artifacts.weights);
 
-    private async validateArtifacts(artifacts: Buffer[]): Promise<void> {
-        if (!artifacts.length) {
-            throw new Error('No artifacts provided');
-        }
+        // Store config
+        const configPath = `${basePath}/config.json`;
+        await bucket.file(configPath).save(artifacts.config);
 
-        // Implement artifact validation logic
-        // This would typically involve format checking, size limits, etc.
-    }
-
-    private async validateConfig(config: ModelConfig): Promise<void> {
-        if (!config.framework || !config.architecture) {
-            throw new Error('Invalid model configuration');
-        }
-
-        // Validate dependencies
-        for (const dep of config.dependencies) {
-            if (!dep.name || !dep.version) {
-                throw new Error('Invalid dependency configuration');
+        // Store checkpoints if any
+        const checkpointPaths = [];
+        if (artifacts.checkpoints) {
+            for (let i = 0; i < artifacts.checkpoints.length; i++) {
+                const checkpointPath = `${basePath}/checkpoint-${i}.h5`;
+                await bucket.file(checkpointPath).save(artifacts.checkpoints[i]);
+                checkpointPaths.push(checkpointPath);
             }
         }
-    }
-
-    private async performSecurityScan(
-        artifacts: Buffer[],
-        config: ModelConfig
-    ): Promise<SecurityMetadata> {
-        const scanResults = await this.securityScanner.scanModel(artifacts, config);
 
         return {
-            vulnerabilityScan: {
-                status: scanResults.vulnerabilities.length > 0 ? 'failed' : 'passed',
-                findings: scanResults.vulnerabilities.map(v => ({
-                    type: v.type,
-                    severity: v.severity,
-                    description: v.description,
-                    recommendation: v.remediation
-                })),
-                lastScanned: new Date()
-            },
-            encryption: {
-                enabled: this.config.security.encryptionEnabled,
-                algorithm: 'AES-256-GCM'
-            },
-            access: {
-                allowedUsers: [],
-                allowedRoles: ['model-admin', 'model-user']
-            }
+            weights: weightsPath,
+            config: configPath,
+            checkpoints: checkpointPaths.length > 0 ? checkpointPaths : undefined
         };
     }
 
-    private async encryptArtifact(data: Buffer): Promise<Buffer> {
-        // Implement encryption logic using Cloud KMS
-        return data;
+    private calculateArtifactsSize(artifacts: { weights: Buffer; config: Buffer; checkpoints?: Buffer[] }): number {
+        let size = artifacts.weights.length + artifacts.config.length;
+        if (artifacts.checkpoints) {
+            size += artifacts.checkpoints.reduce((acc, cp) => acc + cp.length, 0);
+        }
+        return size;
     }
 
-    private async decryptArtifact(data: Buffer, keyId: string): Promise<Buffer> {
-        // Implement decryption logic using Cloud KMS
-        return data;
-    }
-
-    private buildArtifactPath(
+    private async scanVersion(
         modelId: string,
-        version: string,
-        artifactId: string
-    ): string {
-        return `${this.config.storage.path}/${modelId}/${version}/${artifactId}`;
-    }
+        version: string
+    ): Promise<void> {
+        const modelVersion = await this.getVersion(modelId, version);
+        if (!modelVersion) return;
 
-    private async uploadToStorage(path: string, data: Buffer): Promise<void> {
-        const file = this.storage
-            .bucket(this.config.storage.bucket)
-            .file(path);
+        // Perform security scan
+        const scanResult = await this.security.scanModel(
+            modelVersion.artifacts,
+            modelVersion.metadata
+        );
 
-        await file.save(data, {
-            metadata: {
-                contentType: 'application/octet-stream'
-            }
-        });
-    }
-
-    private async downloadFromStorage(path: string): Promise<Buffer> {
-        const file = this.storage
-            .bucket(this.config.storage.bucket)
-            .file(path);
-
-        const [data] = await file.download();
-        return data;
-    }
-
-    private async calculateHash(data: Buffer): Promise<string> {
-        const crypto = require('crypto');
-        return crypto
-            .createHash('sha256')
-            .update(data)
-            .digest('hex');
-    }
-
-    private generateVersion(modelId: string): string {
-        // Implement version generation logic
-        // This should follow semantic versioning
-        return '1.0.0';
-    }
-
-    private initializeMetrics(): ModelMetrics {
-        return {
-            accuracy: 0,
-            loss: 0,
-            latency: 0,
-            memoryUsage: 0,
-            customMetrics: {}
+        // Update security metadata
+        modelVersion.metadata.security = {
+            scanResults: {
+                score: scanResult.score,
+                vulnerabilities: scanResult.vulnerabilities.length,
+                criticalIssues: scanResult.vulnerabilities.filter(v => v.severity === 'critical').length,
+                lastScan: new Date(),
+                details: scanResult.vulnerabilities.map(v => v.description)
+            },
+            encryptionStatus: 'unencrypted',
+            lastScanned: new Date()
         };
+
+        // Store updated version
+        await this.storeVersion(modelVersion);
     }
 
-    private async storeVersionMetadata(version: ModelVersion): Promise<void> {
+    private async storeModelMetadata(model: ModelMetadata): Promise<void> {
+        await this.bigquery
+            .dataset('models')
+            .table('metadata')
+            .insert([this.formatModelForStorage(model)]);
+    }
+
+    private async storeVersion(version: ModelVersion): Promise<void> {
         await this.bigquery
             .dataset('models')
             .table('versions')
             .insert([this.formatVersionForStorage(version)]);
     }
 
-    private async loadVersionFromStore(versionId: string): Promise<ModelVersion | null> {
-        const [rows] = await this.bigquery.query({
-            query: `
-                SELECT *
-                FROM \`models.versions\`
-                WHERE id = @versionId
-            `,
-            params: { versionId }
-        });
-
-        return rows[0] ? this.deserializeVersion(rows[0]) : null;
+    private formatModelForStorage(model: ModelMetadata): Record<string, any> {
+        return {
+            ...model,
+            created: model.created.toISOString(),
+            updated: model.updated.toISOString(),
+            tags: JSON.stringify(model.tags),
+            dependencies: JSON.stringify(model.dependencies),
+            metrics: JSON.stringify(model.metrics),
+            security: JSON.stringify(model.security)
+        };
     }
 
     private formatVersionForStorage(version: ModelVersion): Record<string, any> {
         return {
             ...version,
+            metadata: JSON.stringify(version.metadata),
             artifacts: JSON.stringify(version.artifacts),
-            metrics: JSON.stringify(version.metrics),
-            config: JSON.stringify(version.config),
-            security: JSON.stringify(version.security),
-            createdAt: version.createdAt.toISOString(),
-            updatedAt: version.updatedAt.toISOString(),
-            deployedAt: version.deployedAt?.toISOString()
+            deployment: JSON.stringify(version.deployment)
         };
     }
 
-    private deserializeVersion(row: any): ModelVersion {
-        return {
-            ...row,
-            artifacts: JSON.parse(row.artifacts),
-            metrics: JSON.parse(row.metrics),
-            config: JSON.parse(row.config),
-            security: JSON.parse(row.security),
-            createdAt: new Date(row.createdAt),
-            updatedAt: new Date(row.updatedAt),
-            deployedAt: row.deployedAt ? new Date(row.deployedAt) : undefined
-        };
-    }
+    private async updateModel(model: ModelMetadata): Promise<void> {
+        // Update in-memory cache
+        this.models.set(model.id, model);
 
-    private async loadExistingVersions(): Promise<void> {
-        const [rows] = await this.bigquery.query(`
-            SELECT *
-            FROM \`models.versions\`
-            WHERE status != 'archived'
-        `);
-
-        for (const row of rows) {
-            const version = this.deserializeVersion(row);
-            this.modelVersions.set(version.id, version);
-        }
+        // Update in BigQuery
+        await this.storeModelMetadata(model);
     }
 
     private async setupInfrastructure(): Promise<void> {
-        // Create storage bucket
+        // Create artifact storage bucket
         const [bucketExists] = await this.storage
-            .bucket(this.config.storage.bucket)
+            .bucket(this.ARTIFACT_BUCKET)
             .exists();
 
         if (!bucketExists) {
-            await this.storage.createBucket(this.config.storage.bucket);
+            await this.storage.createBucket(this.ARTIFACT_BUCKET);
         }
 
         // Create BigQuery dataset and tables
@@ -564,59 +490,106 @@ export class ModelRegistryService {
     }
 
     private async createModelTables(dataset: any): Promise<void> {
-        const schema = {
-            fields: [
-                { name: 'id', type: 'STRING' },
-                { name: 'modelId', type: 'STRING' },
-                { name: 'version', type: 'STRING' },
-                { name: 'status', type: 'STRING' },
-                { name: 'artifacts', type: 'JSON' },
-                { name: 'metrics', type: 'JSON' },
-                { name: 'config', type: 'JSON' },
-                { name: 'security', type: 'JSON' },
-                { name: 'createdAt', type: 'TIMESTAMP' },
-                { name: 'updatedAt', type: 'TIMESTAMP' },
-                { name: 'deployedAt', type: 'TIMESTAMP' }
-            ]
+        const tables = {
+            metadata: {
+                fields: [
+                    { name: 'id', type: 'STRING' },
+                    { name: 'name', type: 'STRING' },
+                    { name: 'description', type: 'STRING' },
+                    { name: 'framework', type: 'STRING' },
+                    { name: 'architecture', type: 'STRING' },
+                    { name: 'version', type: 'STRING' },
+                    { name: 'status', type: 'STRING' },
+                    { name: 'creator', type: 'RECORD', fields: [
+                        { name: 'id', type: 'STRING' },
+                        { name: 'name', type: 'STRING' },
+                        { name: 'type', type: 'STRING' }
+                    ]},
+                    { name: 'created', type: 'TIMESTAMP' },
+                    { name: 'updated', type: 'TIMESTAMP' },
+                    { name: 'tags', type: 'JSON' },
+                    { name: 'dependencies', type: 'JSON' },
+                    { name: 'metrics', type: 'JSON' },
+                    { name: 'security', type: 'JSON' }
+                ]
+            },
+            versions: {
+                fields: [
+                    { name: 'version', type: 'STRING' },
+                    { name: 'modelId', type: 'STRING' },
+                    { name: 'artifacts', type: 'JSON' },
+                    { name: 'metadata', type: 'JSON' },
+                    { name: 'deployment', type: 'JSON' }
+                ]
+            }
         };
 
-        await dataset.createTable('versions', { schema });
+        for (const [name, schema] of Object.entries(tables)) {
+            await dataset.createTable(name, { schema });
+        }
     }
 
-    private startMetricsCollection(): void {
-        setInterval(async () => {
-            for (const version of this.modelVersions.values()) {
-                if (version.status === 'deployed') {
-                    try {
-                        const metrics = await this.collectVersionMetrics(version);
-                        version.metrics = { ...version.metrics, ...metrics };
-                        await this.storeVersionMetadata(version);
-                    } catch (error) {
-                        await this.handleError('metrics_collection_error', error);
-                    }
-                }
-            }
-        }, this.config.metrics.collectInterval);
+    private async loadModels(): Promise<void> {
+        // Load models from BigQuery
+        const [rows] = await this.bigquery.query(`
+            SELECT *
+            FROM \`models.metadata\`
+        `);
+
+        for (const row of rows) {
+            const model = this.deserializeModel(row);
+            this.models.set(model.id, model);
+        }
+
+        // Load versions
+        const [versionRows] = await this.bigquery.query(`
+            SELECT *
+            FROM \`models.versions\`
+        `);
+
+        for (const row of versionRows) {
+            const version = this.deserializeVersion(row);
+            const versions = this.versions.get(version.modelId) || [];
+            versions.push(version);
+            this.versions.set(version.modelId, versions);
+        }
     }
 
-    private async collectVersionMetrics(version: ModelVersion): Promise<Partial<ModelMetrics>> {
-        // Implement metrics collection logic
-        return {};
+    private deserializeModel(row: any): ModelMetadata {
+        return {
+            ...row,
+            created: new Date(row.created),
+            updated: new Date(row.updated),
+            tags: JSON.parse(row.tags),
+            dependencies: JSON.parse(row.dependencies),
+            metrics: JSON.parse(row.metrics),
+            security: JSON.parse(row.security)
+        };
+    }
+
+    private deserializeVersion(row: any): ModelVersion {
+        return {
+            ...row,
+            metadata: JSON.parse(row.metadata),
+            artifacts: JSON.parse(row.artifacts),
+            deployment: JSON.parse(row.deployment)
+        };
     }
 
     private setupEventListeners(): void {
         this.eventBus.subscribe({
             id: 'model-registry-monitor',
-            topic: 'model.metrics',
+            topic: 'model.security',
             handler: async (event) => {
-                const { versionId, metrics } = event.data;
-                const version = await this.getVersion(versionId);
-                if (version) {
-                    version.metrics = { ...version.metrics, ...metrics };
-                    await this.storeVersionMetadata(version);
+                if (event.data.type === 'vulnerability_detected') {
+                    await this.handleVulnerability(event.data);
                 }
             }
         });
+    }
+
+    private async handleVulnerability(data: any): Promise<void> {
+        // Implement vulnerability handling logic
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
