@@ -1,569 +1,542 @@
+import { EventBusService } from '../events/event-bus-service';
 import { Monitoring } from '@google-cloud/monitoring';
 import { ErrorReporting } from '@google-cloud/error-reporting';
-import { PubSub } from '@google-cloud/pubsub';
-import { BigQuery } from '@google-cloud/bigquery';
-import { Alert } from '@google-cloud/monitoring/build/protos/protos';
+import { Logging } from '@google-cloud/logging';
 import { v4 as uuidv4 } from 'uuid';
 
-interface MetricData {
+interface Metric {
     name: string;
     value: number;
-    labels: Record<string, string>;
+    labels?: Record<string, string>;
     timestamp?: Date;
 }
 
-interface AlertConfig {
+interface Alert {
+    id: string;
     name: string;
-    metric: string;
     condition: {
-        type: 'threshold' | 'absence' | 'rate';
-        value: number;
+        metric: string;
+        threshold: number;
+        operator: 'gt' | 'lt' | 'eq' | 'gte' | 'lte';
         duration: number; // seconds
     };
-    severity: 'critical' | 'error' | 'warning' | 'info';
-    labels?: Record<string, string>;
-    notification: {
-        channels: ('email' | 'slack' | 'pagerduty')[];
-        message: string;
+    severity: 'critical' | 'high' | 'medium' | 'low';
+    notificationChannels: string[];
+    enabled: boolean;
+    metadata: {
+        created: Date;
+        updated: Date;
+        lastTriggered?: Date;
     };
 }
 
-interface SystemHealth {
-    status: 'healthy' | 'degraded' | 'critical';
-    components: {
-        [key: string]: {
-            status: 'up' | 'down' | 'degraded';
-            lastCheck: Date;
-            metrics: Record<string, number>;
-        };
+interface AlertInstance {
+    id: string;
+    alertId: string;
+    status: 'firing' | 'resolved';
+    value: number;
+    metadata: {
+        startTime: Date;
+        endTime?: Date;
+        notifiedChannels: string[];
     };
-    metrics: {
-        cpu: number;
-        memory: number;
-        latency: number;
-        errorRate: number;
-    };
-    lastUpdated: Date;
 }
 
 export class MonitoringService {
     private monitoring: Monitoring;
     private errorReporting: ErrorReporting;
-    private pubsub: PubSub;
-    private bigquery: BigQuery;
-    private alertConfigs: Map<string, AlertConfig>;
-    private readonly projectId: string;
-    private readonly metricPrefix: string;
-    private readonly HEALTH_CHECK_INTERVAL = 60000; // 1 minute
-    private readonly METRIC_BATCH_SIZE = 100;
-    private readonly METRIC_FLUSH_INTERVAL = 10000; // 10 seconds
+    private logging: Logging;
+    private eventBus: EventBusService;
+    private alerts: Map<string, Alert>;
+    private activeAlerts: Map<string, AlertInstance>;
+    private readonly ALERT_CHECK_INTERVAL = 60000; // 1 minute
+    private readonly METRIC_PREFIX = 'custom.googleapis.com/supercoder';
 
-    private metricBuffer: MetricData[] = [];
-    private flushTimeout: NodeJS.Timeout | null = null;
-
-    constructor(config: {
-        projectId: string;
-        metricPrefix?: string;
-    }) {
-        this.projectId = config.projectId;
-        this.metricPrefix = config.metricPrefix || 'custom';
-        this.monitoring = new Monitoring({ projectId: this.projectId });
-        this.errorReporting = new ErrorReporting({ projectId: this.projectId });
-        this.pubsub = new PubSub({ projectId: this.projectId });
-        this.bigquery = new BigQuery({ projectId: this.projectId });
-        this.alertConfigs = new Map();
+    constructor(
+        eventBus: EventBusService,
+        config: {
+            projectId: string;
+        }
+    ) {
+        this.monitoring = new Monitoring({ projectId: config.projectId });
+        this.errorReporting = new ErrorReporting({ projectId: config.projectId });
+        this.logging = new Logging({ projectId: config.projectId });
+        this.eventBus = eventBus;
+        this.alerts = new Map();
+        this.activeAlerts = new Map();
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
         await this.setupInfrastructure();
-        await this.loadAlertConfigs();
-        this.startHealthChecks();
-        this.setupMetricFlushing();
+        await this.loadAlerts();
+        this.startAlertMonitoring();
+        this.setupEventListeners();
     }
 
-    async recordMetric(data: MetricData): Promise<void> {
+    async recordMetric(metric: Metric): Promise<void> {
         try {
-            // Add timestamp if not provided
-            const metric = {
-                ...data,
-                timestamp: data.timestamp || new Date()
-            };
-
-            // Add to buffer
-            this.metricBuffer.push(metric);
-
-            // Flush if buffer is full
-            if (this.metricBuffer.length >= this.METRIC_BATCH_SIZE) {
-                await this.flushMetrics();
-            }
-
-            // Schedule flush if not already scheduled
-            if (!this.flushTimeout) {
-                this.flushTimeout = setTimeout(
-                    () => this.flushMetrics(),
-                    this.METRIC_FLUSH_INTERVAL
-                );
-            }
-
-            // Check for alerts
-            await this.checkAlerts(metric);
-
-        } catch (error) {
-            this.handleError('metric_recording_error', error);
-        }
-    }
-
-    async createAlert(config: AlertConfig): Promise<void> {
-        try {
-            // Validate alert configuration
-            this.validateAlertConfig(config);
-
-            // Create alert policy
-            const [policy] = await this.monitoring.createAlertPolicy({
-                displayName: config.name,
-                conditions: [{
-                    displayName: `${config.name}_condition`,
-                    conditionThreshold: {
-                        filter: `metric.type="${this.metricPrefix}/${config.metric}"`,
-                        comparison: Alert.ComparisonType.COMPARISON_GT,
-                        thresholdValue: config.condition.value,
-                        duration: { seconds: config.condition.duration },
-                        trigger: { count: 1 }
-                    }
-                }],
-                combiner: Alert.ConditionCombinerType.AND,
-                notificationChannels: await this.getNotificationChannels(config.notification.channels)
-            });
-
-            // Store alert config
-            this.alertConfigs.set(config.name, config);
-
-            // Store in BigQuery for persistence
-            await this.storeAlertConfig(config);
-
-        } catch (error) {
-            this.handleError('alert_creation_error', error);
-            throw error;
-        }
-    }
-
-    async getSystemHealth(): Promise<SystemHealth> {
-        try {
-            const components = await this.checkComponentHealth();
-            const metrics = await this.collectSystemMetrics();
-
-            const health: SystemHealth = {
-                status: this.determineOverallHealth(components, metrics),
-                components,
-                metrics,
-                lastUpdated: new Date()
-            };
-
-            // Store health status
-            await this.storeHealthStatus(health);
-
-            return health;
-
-        } catch (error) {
-            this.handleError('health_check_error', error);
-            throw error;
-        }
-    }
-
-    private async flushMetrics(): Promise<void> {
-        if (this.metricBuffer.length === 0) return;
-
-        try {
-            const metrics = this.metricBuffer;
-            this.metricBuffer = [];
-
-            if (this.flushTimeout) {
-                clearTimeout(this.flushTimeout);
-                this.flushTimeout = null;
-            }
-
-            // Write to Cloud Monitoring
-            await this.writeToCloudMonitoring(metrics);
-
-            // Store in BigQuery for long-term analysis
-            await this.storeMetrics(metrics);
-
-        } catch (error) {
-            this.handleError('metric_flush_error', error);
-            // Restore metrics to buffer on error
-            this.metricBuffer = [...metrics, ...this.metricBuffer];
-        }
-    }
-
-    private async writeToCloudMonitoring(metrics: MetricData[]): Promise<void> {
-        const timeSeries = metrics.map(metric => ({
-            metric: {
-                type: `${this.metricPrefix}/${metric.name}`,
-                labels: metric.labels
-            },
-            resource: {
-                type: 'global',
-                labels: {
-                    project_id: this.projectId
-                }
-            },
-            points: [{
-                interval: {
-                    endTime: {
-                        seconds: Math.floor(metric.timestamp!.getTime() / 1000),
-                        nanos: (metric.timestamp!.getTime() % 1000) * 1e6
+            const timeSeriesData = {
+                metric: {
+                    type: `${this.METRIC_PREFIX}/${metric.name}`,
+                    labels: metric.labels || {}
+                },
+                resource: {
+                    type: 'global',
+                    labels: {
+                        project_id: process.env.PROJECT_ID!
                     }
                 },
-                value: {
-                    doubleValue: metric.value
-                }
-            }]
-        }));
+                points: [{
+                    interval: {
+                        endTime: {
+                            seconds: Math.floor((metric.timestamp || new Date()).getTime() / 1000),
+                            nanos: 0
+                        }
+                    },
+                    value: {
+                        doubleValue: metric.value
+                    }
+                }]
+            };
 
-        await this.monitoring.createTimeSeries({
-            name: `projects/${this.projectId}`,
-            timeSeries
-        });
+            await this.monitoring.createTimeSeries({
+                name: `projects/${process.env.PROJECT_ID}`,
+                timeSeries: [timeSeriesData]
+            });
+
+            // Check alerts for this metric
+            await this.checkAlertsForMetric(metric);
+
+        } catch (error) {
+            await this.handleError('metric_recording_error', error);
+        }
     }
 
-    private async checkAlerts(metric: MetricData): Promise<void> {
-        for (const [name, config] of this.alertConfigs.entries()) {
-            if (config.metric === metric.name) {
-                const triggered = this.evaluateAlertCondition(config, metric);
-                if (triggered) {
-                    await this.triggerAlert(config, metric);
+    async createAlert(alert: Omit<Alert, 'id' | 'metadata'>): Promise<string> {
+        try {
+            const alertId = uuidv4();
+            const newAlert: Alert = {
+                ...alert,
+                id: alertId,
+                metadata: {
+                    created: new Date(),
+                    updated: new Date()
+                }
+            };
+
+            // Validate alert configuration
+            await this.validateAlertConfig(newAlert);
+
+            // Store alert
+            await this.storeAlert(newAlert);
+            this.alerts.set(alertId, newAlert);
+
+            // Create cloud monitoring alert policy
+            await this.createCloudAlertPolicy(newAlert);
+
+            return alertId;
+
+        } catch (error) {
+            await this.handleError('alert_creation_error', error);
+            throw error;
+        }
+    }
+
+    async reportError(
+        error: Error,
+        context?: Record<string, any>
+    ): Promise<void> {
+        try {
+            // Report to Error Reporting
+            this.errorReporting.report(error, {
+                ...context,
+                time: new Date().toISOString()
+            });
+
+            // Log error
+            const log = this.logging.log('errors');
+            const metadata = {
+                resource: {
+                    type: 'global',
+                    labels: {
+                        project_id: process.env.PROJECT_ID!
+                    }
+                },
+                severity: 'ERROR'
+            };
+
+            await log.write(log.entry(metadata, {
+                error: error.message,
+                stack: error.stack,
+                context
+            }));
+
+            // Record error metric
+            await this.recordMetric({
+                name: 'errors',
+                value: 1,
+                labels: {
+                    type: error.name,
+                    message: error.message
+                }
+            });
+
+            // Publish error event
+            await this.eventBus.publish('monitoring.error', {
+                type: 'error',
+                source: 'monitoring',
+                data: {
+                    error: error.message,
+                    stack: error.stack,
+                    context,
+                    timestamp: new Date()
+                },
+                metadata: {
+                    severity: 'high',
+                    environment: process.env.NODE_ENV || 'development'
+                }
+            });
+
+        } catch (reportError) {
+            console.error('Failed to report error:', reportError);
+        }
+    }
+
+    private async checkAlertsForMetric(metric: Metric): Promise<void> {
+        for (const alert of this.alerts.values()) {
+            if (alert.enabled && alert.condition.metric === metric.name) {
+                const isTriggered = this.evaluateAlertCondition(alert, metric.value);
+                
+                if (isTriggered) {
+                    await this.triggerAlert(alert, metric.value);
+                } else {
+                    await this.resolveAlert(alert);
                 }
             }
         }
     }
 
-    private evaluateAlertCondition(
-        config: AlertConfig,
-        metric: MetricData
-    ): boolean {
-        switch (config.condition.type) {
-            case 'threshold':
-                return metric.value > config.condition.value;
-            case 'absence':
-                return metric.value === 0;
-            case 'rate':
-                // Implement rate-based alerting
-                return false;
+    private evaluateAlertCondition(alert: Alert, value: number): boolean {
+        const { threshold, operator } = alert.condition;
+
+        switch (operator) {
+            case 'gt':
+                return value > threshold;
+            case 'lt':
+                return value < threshold;
+            case 'eq':
+                return value === threshold;
+            case 'gte':
+                return value >= threshold;
+            case 'lte':
+                return value <= threshold;
             default:
                 return false;
         }
     }
 
-    private async triggerAlert(
-        config: AlertConfig,
-        metric: MetricData
-    ): Promise<void> {
-        const alertId = uuidv4();
-        const alert = {
-            id: alertId,
-            name: config.name,
-            severity: config.severity,
-            metric: metric.name,
-            value: metric.value,
-            timestamp: new Date(),
-            labels: { ...config.labels, ...metric.labels }
-        };
+    private async triggerAlert(alert: Alert, value: number): Promise<void> {
+        const existingInstance = Array.from(this.activeAlerts.values())
+            .find(a => a.alertId === alert.id);
 
-        // Publish alert
-        await this.pubsub
-            .topic('monitoring-alerts')
-            .publish(Buffer.from(JSON.stringify(alert)));
-
-        // Store alert
-        await this.storeAlert(alert);
-
-        // Send notifications
-        await this.sendAlertNotifications(config, alert);
-    }
-
-    private async sendAlertNotifications(
-        config: AlertConfig,
-        alert: any
-    ): Promise<void> {
-        const message = this.formatAlertMessage(config, alert);
-        
-        for (const channel of config.notification.channels) {
-            try {
-                switch (channel) {
-                    case 'email':
-                        // Implement email notification
-                        break;
-                    case 'slack':
-                        // Implement Slack notification
-                        break;
-                    case 'pagerduty':
-                        // Implement PagerDuty notification
-                        break;
+        if (!existingInstance) {
+            const instance: AlertInstance = {
+                id: uuidv4(),
+                alertId: alert.id,
+                status: 'firing',
+                value,
+                metadata: {
+                    startTime: new Date(),
+                    notifiedChannels: []
                 }
+            };
+
+            this.activeAlerts.set(instance.id, instance);
+            await this.notifyAlertChannels(alert, instance);
+
+            // Update alert metadata
+            alert.metadata.lastTriggered = new Date();
+            await this.updateAlert(alert);
+        }
+    }
+
+    private async resolveAlert(alert: Alert): Promise<void> {
+        const instance = Array.from(this.activeAlerts.values())
+            .find(a => a.alertId === alert.id);
+
+        if (instance && instance.status === 'firing') {
+            instance.status = 'resolved';
+            instance.metadata.endTime = new Date();
+
+            await this.notifyAlertResolution(alert, instance);
+            this.activeAlerts.delete(instance.id);
+        }
+    }
+
+    private async notifyAlertChannels(alert: Alert, instance: AlertInstance): Promise<void> {
+        for (const channel of alert.notificationChannels) {
+            try {
+                await this.sendNotification(channel, {
+                    type: 'alert_triggered',
+                    alert: {
+                        name: alert.name,
+                        severity: alert.severity,
+                        value: instance.value,
+                        threshold: alert.condition.threshold,
+                        timestamp: instance.metadata.startTime
+                    }
+                });
+
+                instance.metadata.notifiedChannels.push(channel);
+
             } catch (error) {
-                this.handleError('notification_error', error);
+                await this.handleError('notification_error', error);
             }
         }
     }
 
-    private formatAlertMessage(config: AlertConfig, alert: any): string {
-        return config.notification.message
-            .replace('${name}', alert.name)
-            .replace('${value}', alert.value)
-            .replace('${threshold}', config.condition.value);
-    }
+    private async notifyAlertResolution(alert: Alert, instance: AlertInstance): Promise<void> {
+        for (const channel of alert.notificationChannels) {
+            try {
+                await this.sendNotification(channel, {
+                    type: 'alert_resolved',
+                    alert: {
+                        name: alert.name,
+                        severity: alert.severity,
+                        duration: instance.metadata.endTime!.getTime() - 
+                                instance.metadata.startTime.getTime(),
+                        timestamp: instance.metadata.endTime
+                    }
+                });
 
-    private async checkComponentHealth(): Promise<SystemHealth['components']> {
-        const components: SystemHealth['components'] = {};
-
-        // Check each component's health
-        const checks = [
-            this.checkDatabaseHealth(),
-            this.checkAPIHealth(),
-            this.checkStorageHealth(),
-            // Add more component checks as needed
-        ];
-
-        const results = await Promise.allSettled(checks);
-        
-        results.forEach((result, index) => {
-            const componentName = ['database', 'api', 'storage'][index];
-            if (result.status === 'fulfilled') {
-                components[componentName] = result.value;
-            } else {
-                components[componentName] = {
-                    status: 'down',
-                    lastCheck: new Date(),
-                    metrics: {}
-                };
+            } catch (error) {
+                await this.handleError('notification_error', error);
             }
-        });
-
-        return components;
-    }
-
-    private async checkDatabaseHealth(): Promise<SystemHealth['components']['database']> {
-        // Implement database health check
-        return {
-            status: 'up',
-            lastCheck: new Date(),
-            metrics: {
-                connectionCount: 0,
-                latency: 0
-            }
-        };
-    }
-
-    private async checkAPIHealth(): Promise<SystemHealth['components']['api']> {
-        // Implement API health check
-        return {
-            status: 'up',
-            lastCheck: new Date(),
-            metrics: {
-                requestRate: 0,
-                errorRate: 0
-            }
-        };
-    }
-
-    private async checkStorageHealth(): Promise<SystemHealth['components']['storage']> {
-        // Implement storage health check
-        return {
-            status: 'up',
-            lastCheck: new Date(),
-            metrics: {
-                usedSpace: 0,
-                iops: 0
-            }
-        };
-    }
-
-    private async collectSystemMetrics(): Promise<SystemHealth['metrics']> {
-        // Collect system-wide metrics
-        return {
-            cpu: await this.getCPUUtilization(),
-            memory: await this.getMemoryUtilization(),
-            latency: await this.getAverageLatency(),
-            errorRate: await this.getErrorRate()
-        };
-    }
-
-    private async getCPUUtilization(): Promise<number> {
-        // Implement CPU utilization measurement
-        return 0;
-    }
-
-    private async getMemoryUtilization(): Promise<number> {
-        // Implement memory utilization measurement
-        return 0;
-    }
-
-    private async getAverageLatency(): Promise<number> {
-        // Implement latency measurement
-        return 0;
-    }
-
-    private async getErrorRate(): Promise<number> {
-        // Implement error rate calculation
-        return 0;
-    }
-
-    private determineOverallHealth(
-        components: SystemHealth['components'],
-        metrics: SystemHealth['metrics']
-    ): SystemHealth['status'] {
-        // Check component status
-        const componentStatus = Object.values(components).map(c => c.status);
-        if (componentStatus.includes('down')) {
-            return 'critical';
         }
-        if (componentStatus.includes('degraded')) {
-            return 'degraded';
-        }
-
-        // Check metrics thresholds
-        if (
-            metrics.cpu > 90 ||
-            metrics.memory > 90 ||
-            metrics.errorRate > 5 ||
-            metrics.latency > 1000
-        ) {
-            return 'degraded';
-        }
-
-        return 'healthy';
     }
 
-    private validateAlertConfig(config: AlertConfig): void {
-        if (!config.name || !config.metric || !config.condition) {
+    private async sendNotification(channel: string, message: any): Promise<void> {
+        // Implement notification sending logic based on channel type
+        // This could integrate with various notification services
+    }
+
+    private async validateAlertConfig(alert: Alert): Promise<void> {
+        if (!alert.name || !alert.condition || !alert.notificationChannels.length) {
             throw new Error('Invalid alert configuration');
         }
 
-        if (!['threshold', 'absence', 'rate'].includes(config.condition.type)) {
-            throw new Error('Invalid condition type');
+        if (!['gt', 'lt', 'eq', 'gte', 'lte'].includes(alert.condition.operator)) {
+            throw new Error('Invalid alert condition operator');
         }
 
-        if (config.condition.duration < 0) {
-            throw new Error('Invalid duration');
-        }
-    }
-
-    private async getNotificationChannels(
-        channels: AlertConfig['notification']['channels']
-    ): Promise<string[]> {
-        // Implement notification channel lookup
-        return [];
-    }
-
-    private async setupInfrastructure(): Promise<void> {
-        const dataset = this.bigquery.dataset('monitoring');
-        const [exists] = await dataset.exists();
-
-        if (!exists) {
-            await dataset.create();
-            await this.createMonitoringTables(dataset);
+        if (alert.condition.duration < 0) {
+            throw new Error('Invalid alert condition duration');
         }
     }
 
-    private async createMonitoringTables(dataset: any): Promise<void> {
-        const tables = {
-            metrics: {
-                fields: [
-                    { name: 'name', type: 'STRING' },
-                    { name: 'value', type: 'FLOAT' },
-                    { name: 'labels', type: 'JSON' },
-                    { name: 'timestamp', type: 'TIMESTAMP' }
-                ]
+    private async createCloudAlertPolicy(alert: Alert): Promise<void> {
+        const policy = {
+            displayName: alert.name,
+            conditions: [{
+                displayName: `${alert.name} condition`,
+                conditionThreshold: {
+                    filter: `metric.type="${this.METRIC_PREFIX}/${alert.condition.metric}"`,
+                    comparison: this.translateOperator(alert.condition.operator),
+                    threshold: alert.condition.threshold,
+                    duration: {
+                        seconds: alert.condition.duration
+                    },
+                    trigger: {
+                        count: 1
+                    }
+                }
+            }],
+            alertStrategy: {
+                notificationRate: {
+                    period: {
+                        seconds: 300 // 5 minutes
+                    }
+                }
             },
-            alerts: {
-                fields: [
-                    { name: 'id', type: 'STRING' },
-                    { name: 'name', type: 'STRING' },
-                    { name: 'severity', type: 'STRING' },
-                    { name: 'metric', type: 'STRING' },
-                    { name: 'value', type: 'FLOAT' },
-                    { name: 'labels', type: 'JSON' },
-                    { name: 'timestamp', type: 'TIMESTAMP' }
-                ]
-            },
-            health: {
-                fields: [
-                    { name: 'timestamp', type: 'TIMESTAMP' },
-                    { name: 'status', type: 'STRING' },
-                    { name: 'components', type: 'JSON' },
-                    { name: 'metrics', type: 'JSON' }
-                ]
-            }
+            notificationChannels: alert.notificationChannels
         };
 
-        for (const [name, schema] of Object.entries(tables)) {
-            await dataset.createTable(name, { schema });
-        }
-    }
-
-    private async storeMetrics(metrics: MetricData[]): Promise<void> {
-        await this.bigquery
-            .dataset('monitoring')
-            .table('metrics')
-            .insert(metrics.map(m => ({
-                ...m,
-                labels: JSON.stringify(m.labels),
-                timestamp: m.timestamp!.toISOString()
-            })));
-    }
-
-    private async storeAlert(alert: any): Promise<void> {
-        await this.bigquery
-            .dataset('monitoring')
-            .table('alerts')
-            .insert([{
-                ...alert,
-                labels: JSON.stringify(alert.labels),
-                timestamp: alert.timestamp.toISOString()
-            }]);
-    }
-
-    private async storeAlertConfig(config: AlertConfig): Promise<void> {
-        // Store alert configuration for persistence
-    }
-
-    private async storeHealthStatus(health: SystemHealth): Promise<void> {
-        await this.bigquery
-            .dataset('monitoring')
-            .table('health')
-            .insert([{
-                timestamp: health.lastUpdated.toISOString(),
-                status: health.status,
-                components: JSON.stringify(health.components),
-                metrics: JSON.stringify(health.metrics)
-            }]);
-    }
-
-    private async loadAlertConfigs(): Promise<void> {
-        // Load alert configurations from storage
-    }
-
-    private startHealthChecks(): void {
-        setInterval(async () => {
-            try {
-                await this.getSystemHealth();
-            } catch (error) {
-                this.handleError('health_check_error', error);
-            }
-        }, this.HEALTH_CHECK_INTERVAL);
-    }
-
-    private setupMetricFlushing(): void {
-        // Ensure metrics are flushed before shutdown
-        process.on('SIGTERM', async () => {
-            await this.flushMetrics();
+        await this.monitoring.createAlertPolicy({
+            name: `projects/${process.env.PROJECT_ID}`,
+            alertPolicy: policy
         });
     }
 
-    private handleError(type: string, error: Error): void {
+    private translateOperator(operator: Alert['condition']['operator']): string {
+        const mapping: Record<string, string> = {
+            'gt': 'GREATER_THAN',
+            'lt': 'LESS_THAN',
+            'eq': 'EQUAL_TO',
+            'gte': 'GREATER_THAN_OR_EQUAL_TO',
+            'lte': 'LESS_THAN_OR_EQUAL_TO'
+        };
+        return mapping[operator];
+    }
+
+    private async setupInfrastructure(): Promise<void> {
+        // Set up custom metrics descriptor
+        await this.monitoring.createMetricDescriptor({
+            name: `projects/${process.env.PROJECT_ID}/metricDescriptors/${this.METRIC_PREFIX}`,
+            metricDescriptor: {
+                displayName: 'SuperCoder Custom Metrics',
+                description: 'Custom metrics for SuperCoder platform',
+                type: this.METRIC_PREFIX,
+                metricKind: 'GAUGE',
+                valueType: 'DOUBLE',
+                labels: [{
+                    key: 'component',
+                    valueType: 'STRING',
+                    description: 'Component generating the metric'
+                }]
+            }
+        });
+    }
+
+    private async loadAlerts(): Promise<void> {
+        const [policies] = await this.monitoring.listAlertPolicies({
+            name: `projects/${process.env.PROJECT_ID}`
+        });
+
+        for (const policy of policies) {
+            const alert = this.convertPolicyToAlert(policy);
+            this.alerts.set(alert.id, alert);
+        }
+    }
+
+    private convertPolicyToAlert(policy: any): Alert {
+        return {
+            id: policy.name.split('/').pop()!,
+            name: policy.displayName,
+            condition: this.extractConditionFromPolicy(policy),
+            severity: this.determineSeverityFromPolicy(policy),
+            notificationChannels: policy.notificationChannels || [],
+            enabled: policy.enabled,
+            metadata: {
+                created: new Date(policy.creationRecord.mutateTime),
+                updated: new Date(policy.mutationRecord.mutateTime)
+            }
+        };
+    }
+
+    private extractConditionFromPolicy(policy: any): Alert['condition'] {
+        const condition = policy.conditions[0];
+        return {
+            metric: condition.conditionThreshold.filter.split('"')[1].split('/').pop(),
+            threshold: condition.conditionThreshold.threshold,
+            operator: this.reverseTranslateOperator(condition.conditionThreshold.comparison),
+            duration: parseInt(condition.conditionThreshold.duration.seconds)
+        };
+    }
+
+    private reverseTranslateOperator(cloudOperator: string): Alert['condition']['operator'] {
+        const mapping: Record<string, Alert['condition']['operator']> = {
+            'GREATER_THAN': 'gt',
+            'LESS_THAN': 'lt',
+            'EQUAL_TO': 'eq',
+            'GREATER_THAN_OR_EQUAL_TO': 'gte',
+            'LESS_THAN_OR_EQUAL_TO': 'lte'
+        };
+        return mapping[cloudOperator];
+    }
+
+    private determineSeverityFromPolicy(policy: any): Alert['severity'] {
+        if (policy.userLabels?.severity) {
+            return policy.userLabels.severity;
+        }
+        return 'medium';
+    }
+
+    private async storeAlert(alert: Alert): Promise<void> {
+        // Store in Cloud Monitoring
+        await this.createCloudAlertPolicy(alert);
+    }
+
+    private async updateAlert(alert: Alert): Promise<void> {
+        this.alerts.set(alert.id, alert);
+        await this.updateCloudAlertPolicy(alert);
+    }
+
+    private async updateCloudAlertPolicy(alert: Alert): Promise<void> {
+        // Update Cloud Monitoring alert policy
+    }
+
+    private startAlertMonitoring(): void {
+        setInterval(async () => {
+            try {
+                await this.checkActiveAlerts();
+            } catch (error) {
+                await this.handleError('alert_monitoring_error', error);
+            }
+        }, this.ALERT_CHECK_INTERVAL);
+    }
+
+    private async checkActiveAlerts(): Promise<void> {
+        for (const instance of this.activeAlerts.values()) {
+            const alert = this.alerts.get(instance.alertId);
+            if (alert) {
+                // Re-evaluate alert condition
+                const metric = await this.getLatestMetricValue(alert.condition.metric);
+                if (metric && !this.evaluateAlertCondition(alert, metric)) {
+                    await this.resolveAlert(alert);
+                }
+            }
+        }
+    }
+
+    private async getLatestMetricValue(metricName: string): Promise<number | null> {
+        try {
+            const [timeSeries] = await this.monitoring.listTimeSeries({
+                name: `projects/${process.env.PROJECT_ID}`,
+                filter: `metric.type="${this.METRIC_PREFIX}/${metricName}"`,
+                interval: {
+                    startTime: {
+                        seconds: Math.floor(Date.now() / 1000) - 300 // Last 5 minutes
+                    },
+                    endTime: {
+                        seconds: Math.floor(Date.now() / 1000)
+                    }
+                },
+                orderBy: 'timestamp desc',
+                pageSize: 1
+            });
+
+            if (timeSeries && timeSeries[0]?.points[0]?.value?.doubleValue) {
+                return timeSeries[0].points[0].value.doubleValue;
+            }
+
+            return null;
+
+        } catch (error) {
+            await this.handleError('metric_fetch_error', error);
+            return null;
+        }
+    }
+
+    private setupEventListeners(): void {
+        this.eventBus.subscribe({
+            id: 'monitoring-service',
+            topic: 'system.metrics',
+            handler: async (event) => {
+                if (event.data.type === 'metric') {
+                    await this.recordMetric(event.data.metric);
+                }
+            }
+        });
+    }
+
+    private async handleError(type: string, error: Error): Promise<void> {
         console.error(`Monitoring error (${type}):`, error);
-        this.errorReporting.report(error);
+        
+        await this.reportError(error, {
+            component: 'monitoring',
+            type
+        });
     }
 }

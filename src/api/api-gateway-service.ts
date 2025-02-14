@@ -35,22 +35,13 @@ export class APIGatewayService {
     async handleRequest(request: APIRequest): Promise<APIResponse> {
         const startTime = Date.now();
         try {
-            // Rate limiting check
             await this.checkRateLimit(request);
-
-            // Authentication
             const token = request.headers['authorization'];
-            if (!await this.auth.validateToken(token)) {
+            if (!token || !(await this.auth.validateToken(token))) {
                 throw new Error('Unauthorized');
             }
-
-            // Request validation
             this.validateRequest(request);
-
-            // Process request
             const response = await this.processRequest(request);
-
-            // Record metrics
             await this.monitor.recordMetric({
                 name: 'api_request',
                 value: Date.now() - startTime,
@@ -60,9 +51,7 @@ export class APIGatewayService {
                     status: response.status.toString()
                 }
             });
-
             return response;
-
         } catch (error) {
             await this.monitor.recordMetric({
                 name: 'api_error',
@@ -80,24 +69,24 @@ export class APIGatewayService {
     private async checkRateLimit(request: APIRequest): Promise<void> {
         const key = `${request.headers['x-client-id']}-${request.path}`;
         const currentCount = this.rateLimits.get(key) || 0;
-        
-        if (currentCount >= 100) { // 100 requests per minute
+        if (currentCount >= 100) {
             throw new Error('Rate limit exceeded');
         }
-
         this.rateLimits.set(key, currentCount + 1);
-        setTimeout(() => this.rateLimits.set(key, currentCount), 60000);
+        setTimeout(() => {
+            const updated = this.rateLimits.get(key) || 0;
+            this.rateLimits.set(key, Math.max(0, updated - 1));
+        }, 60000);
     }
 
     private validateRequest(request: APIRequest): void {
-        // Implement request validation logic
         if (!request.path || !request.method) {
             throw new Error('Invalid request format');
         }
+        // Optional: Add header and body schema validations here.
     }
 
     private async processRequest(request: APIRequest): Promise<APIResponse> {
-        // Implement request processing logic
         return {
             status: 200,
             body: { message: 'Success' },

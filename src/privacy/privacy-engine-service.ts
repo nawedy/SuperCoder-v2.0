@@ -1,135 +1,172 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
 import { EventBusService } from '../events/event-bus-service';
 import { AuditTrailService } from '../audit/audit-trail-service';
-import { CloudDLP } from '@google-cloud/dlp';
-import { KMS } from '@google-cloud/kms';
+import { DLP } from '@google-cloud/dlp';
+import { SecurityConfig } from '../config/security-config';
 import { v4 as uuidv4 } from 'uuid';
 
 interface PrivacyConfig {
     piiDetection: {
         enabled: boolean;
-        infoTypes: string[];
-        minLikelihood: 'VERY_UNLIKELY' | 'UNLIKELY' | 'POSSIBLE' | 'LIKELY' | 'VERY_LIKELY';
-    };
-    encryption: {
-        enabled: boolean;
-        keyId?: string;
-        algorithm: 'AES256' | 'RSA2048';
+        sensitivity: 'high' | 'medium' | 'low';
+        customPatterns?: RegExp[];
     };
     anonymization: {
-        enabled: boolean;
-        method: 'mask' | 'redact' | 'replace' | 'tokenize';
-        preserveFormat: boolean;
+        method: 'mask' | 'encrypt' | 'redact';
+        preserveLength: boolean;
+        maskChar?: string;
     };
-    retention: {
-        period: number; // days
-        autoDelete: boolean;
+    compliance: {
+        gdpr: boolean;
+        hipaa: boolean;
+        ccpa: boolean;
+        customRules?: ComplianceRule[];
     };
 }
 
-interface PrivacyRule {
+interface ComplianceRule {
     id: string;
     name: string;
-    type: 'pii' | 'confidential' | 'sensitive' | 'public';
     pattern: RegExp | string;
-    action: 'encrypt' | 'mask' | 'redact' | 'tokenize';
-    context?: string[];
-    priority: number;
+    action: 'mask' | 'encrypt' | 'redact' | 'allow';
+    category: string;
 }
 
-interface PrivacyScanResult {
-    findings: {
-        type: string;
-        value: string;
-        location: {
-            startIndex: number;
-            endIndex: number;
-            path?: string[];
-        };
-        likelihood: string;
-    }[];
-    statistics: {
-        scannedBytes: number;
-        sensitiveDataFound: number;
-        processedFields: number;
+interface PrivacyResult {
+    id: string;
+    timestamp: Date;
+    findings: PrivacyFinding[];
+    stats: {
+        piiCount: number;
+        sensitiveDataTypes: string[];
+        riskLevel: 'high' | 'medium' | 'low';
     };
+    actions: {
+        type: string;
+        field: string;
+        action: string;
+    }[];
+    compliance: {
+        status: 'compliant' | 'non-compliant';
+        violations: string[];
+        recommendations: string[];
+    };
+}
+
+interface PrivacyFinding {
+    type: string;
+    value: string;
+    location: {
+        field: string;
+        start: number;
+        end: number;
+    };
+    confidence: number;
+    action: string;
 }
 
 export class PrivacyEngineService {
     private monitor: MonitoringService;
     private eventBus: EventBusService;
     private audit: AuditTrailService;
-    private dlp: CloudDLP;
-    private kms: KMS;
-    private rules: Map<string, PrivacyRule>;
-    private config: PrivacyConfig;
+    private dlp: DLP;
+    private security: SecurityConfig;
+    private complianceRules: Map<string, ComplianceRule>;
+    private readonly DEFAULT_CONFIG: PrivacyConfig = {
+        piiDetection: {
+            enabled: true,
+            sensitivity: 'high'
+        },
+        anonymization: {
+            method: 'mask',
+            preserveLength: true,
+            maskChar: '*'
+        },
+        compliance: {
+            gdpr: true,
+            hipaa: true,
+            ccpa: true
+        }
+    };
 
     constructor(
         monitor: MonitoringService,
         eventBus: EventBusService,
         audit: AuditTrailService,
+        security: SecurityConfig,
         config: {
             projectId: string;
-            privacyConfig: PrivacyConfig;
         }
     ) {
         this.monitor = monitor;
         this.eventBus = eventBus;
         this.audit = audit;
-        this.dlp = new CloudDLP();
-        this.kms = new KMS({ projectId: config.projectId });
-        this.rules = new Map();
-        this.config = config.privacyConfig;
+        this.security = security;
+        this.dlp = new DLP({ projectId: config.projectId });
+        this.complianceRules = new Map();
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
-        await this.loadPrivacyRules();
+        await this.loadComplianceRules();
         this.setupEventListeners();
     }
 
     async scanData(
         data: any,
-        context: string
-    ): Promise<PrivacyScanResult> {
+        dataType: string,
+        config?: Partial<PrivacyConfig>
+    ): Promise<PrivacyResult> {
         const startTime = Date.now();
         try {
-            let findings: PrivacyScanResult['findings'] = [];
-            let scannedBytes = 0;
+            // Merge config with defaults
+            const effectiveConfig = this.mergeConfig(config);
 
-            // Convert data to string if needed
-            const content = typeof data === 'string' ? data : JSON.stringify(data);
-            scannedBytes = Buffer.from(content).length;
-
-            // Perform DLP scan
-            if (this.config.piiDetection.enabled) {
-                const dlpFindings = await this.performDLPScan(content);
-                findings = [...findings, ...dlpFindings];
-            }
-
-            // Apply custom rules
-            const ruleFindings = await this.applyPrivacyRules(content, context);
-            findings = [...findings, ...ruleFindings];
-
-            // Create result
-            const result: PrivacyScanResult = {
-                findings,
-                statistics: {
-                    scannedBytes,
-                    sensitiveDataFound: findings.length,
-                    processedFields: this.countProcessedFields(data)
+            // Initialize result
+            const result: PrivacyResult = {
+                id: uuidv4(),
+                timestamp: new Date(),
+                findings: [],
+                stats: {
+                    piiCount: 0,
+                    sensitiveDataTypes: [],
+                    riskLevel: 'low'
+                },
+                actions: [],
+                compliance: {
+                    status: 'compliant',
+                    violations: [],
+                    recommendations: []
                 }
             };
+
+            // Detect PII and sensitive data
+            if (effectiveConfig.piiDetection.enabled) {
+                const piiFindings = await this.detectPII(data, dataType);
+                result.findings.push(...piiFindings);
+                result.stats.piiCount = piiFindings.length;
+                result.stats.sensitiveDataTypes = this.extractSensitiveDataTypes(piiFindings);
+            }
+
+            // Check compliance
+            const complianceResult = await this.checkCompliance(
+                data,
+                effectiveConfig.compliance
+            );
+            result.compliance = complianceResult;
+
+            // Determine risk level
+            result.stats.riskLevel = this.calculateRiskLevel(result);
 
             // Record metrics
             await this.monitor.recordMetric({
                 name: 'privacy_scan',
                 value: Date.now() - startTime,
                 labels: {
-                    context,
-                    findings: findings.length.toString(),
-                    bytes: scannedBytes.toString()
+                    data_type: dataType,
+                    risk_level: result.stats.riskLevel,
+                    pii_count: result.stats.piiCount.toString()
                 }
             });
 
@@ -143,7 +180,7 @@ export class PrivacyEngineService {
                 },
                 resource: {
                     type: 'data',
-                    id: context,
+                    id: result.id,
                     action: 'scan'
                 },
                 context: {
@@ -151,10 +188,10 @@ export class PrivacyEngineService {
                     ipAddress: 'internal',
                     userAgent: 'system'
                 },
-                status: 'success',
+                status: result.compliance.status,
                 details: {
-                    findings: findings.length,
-                    bytes: scannedBytes
+                    findings: result.stats.piiCount,
+                    risk_level: result.stats.riskLevel
                 }
             });
 
@@ -166,49 +203,394 @@ export class PrivacyEngineService {
         }
     }
 
-    async protectData(
+    async anonymizeData(
         data: any,
-        scanResult: PrivacyScanResult
+        findings: PrivacyFinding[],
+        config?: Partial<PrivacyConfig>
     ): Promise<any> {
         try {
-            let protected_data = data;
+            const effectiveConfig = this.mergeConfig(config);
+            let anonymizedData = JSON.stringify(data);
 
-            // Sort findings by location to process from end to start
-            const sortedFindings = scanResult.findings.sort(
-                (a, b) => b.location.startIndex - a.location.startIndex
+            // Sort findings by location end index in reverse order
+            // to avoid offset issues when replacing text
+            const sortedFindings = [...findings].sort(
+                (a, b) => b.location.end - a.location.end
             );
 
-            // Apply protections
             for (const finding of sortedFindings) {
-                const rule = this.findMatchingRule(finding.type);
-                if (rule) {
-                    protected_data = await this.applyProtection(
-                        protected_data,
-                        finding,
-                        rule
-                    );
-                }
+                const replacement = this.getAnonymizedValue(
+                    finding,
+                    effectiveConfig.anonymization
+                );
+
+                anonymizedData = this.replaceInString(
+                    anonymizedData,
+                    finding.location.start,
+                    finding.location.end,
+                    replacement
+                );
             }
 
-            // Final encryption if enabled
-            if (this.config.encryption.enabled) {
-                protected_data = await this.encryptData(protected_data);
-            }
-
-            return protected_data;
+            return JSON.parse(anonymizedData);
 
         } catch (error) {
-            await this.handleError('data_protection_error', error);
+            await this.handleError('anonymization_error', error);
             throw error;
         }
     }
 
-    async addPrivacyRule(rule: Omit<PrivacyRule, 'id'>): Promise<string> {
+    async addComplianceRule(rule: Omit<ComplianceRule, 'id'>): Promise<string> {
         try {
             const ruleId = uuidv4();
-            const newRule: PrivacyRule = {
+            const newRule: ComplianceRule = {
                 ...rule,
                 id: ruleId
             };
 
-            //
+            // Validate rule
+            await this.validateComplianceRule(newRule);
+
+            // Store rule
+            this.complianceRules.set(ruleId, newRule);
+
+            // Audit log
+            await this.audit.logEvent({
+                eventType: 'compliance.rule.create',
+                actor: {
+                    id: 'system',
+                    type: 'service',
+                    metadata: {}
+                },
+                resource: {
+                    type: 'compliance-rule',
+                    id: ruleId,
+                    action: 'create'
+                },
+                context: {
+                    location: 'privacy-engine',
+                    ipAddress: 'internal',
+                    userAgent: 'system'
+                },
+                status: 'success',
+                details: {
+                    name: rule.name,
+                    category: rule.category
+                }
+            });
+
+            return ruleId;
+
+        } catch (error) {
+            await this.handleError('compliance_rule_creation_error', error);
+            throw error;
+        }
+    }
+
+    private async detectPII(data: any, dataType: string): Promise<PrivacyFinding[]> {
+        const findings: PrivacyFinding[] = [];
+
+        // Use Cloud DLP to detect sensitive data
+        const request = {
+            parent: `projects/${process.env.PROJECT_ID}`,
+            item: {
+                value: JSON.stringify(data)
+            },
+            inspectConfig: {
+                includeQuote: true,
+                minLikelihood: 'LIKELY',
+                limits: {
+                    maxFindingsPerRequest: 100
+                },
+                infoTypes: this.getInfoTypesForDataType(dataType)
+            }
+        };
+
+        const [response] = await this.dlp.inspectContent(request);
+        
+        if (response.result?.findings) {
+            for (const finding of response.result.findings) {
+                findings.push({
+                    type: finding.infoType?.name || 'unknown',
+                    value: finding.quote || '',
+                    location: {
+                        field: 'content',
+                        start: finding.location?.byteRange?.start || 0,
+                        end: finding.location?.byteRange?.end || 0
+                    },
+                    confidence: this.getLikelihoodScore(finding.likelihood),
+                    action: this.determineAction(finding)
+                });
+            }
+        }
+
+        return findings;
+    }
+
+    private getInfoTypesForDataType(dataType: string): { name: string }[] {
+        // Define info types based on data type
+        const commonTypes = [
+            { name: 'PERSON_NAME' },
+            { name: 'EMAIL_ADDRESS' },
+            { name: 'PHONE_NUMBER' },
+            { name: 'IP_ADDRESS' }
+        ];
+
+        // Add specific types based on data type
+        switch (dataType) {
+            case 'health':
+                return [
+                    ...commonTypes,
+                    { name: 'MEDICAL_RECORD_NUMBER' },
+                    { name: 'MEDICAL_TERM' }
+                ];
+            case 'financial':
+                return [
+                    ...commonTypes,
+                    { name: 'CREDIT_CARD_NUMBER' },
+                    { name: 'BANK_ACCOUNT_NUMBER' }
+                ];
+            default:
+                return commonTypes;
+        }
+    }
+
+    private getLikelihoodScore(likelihood: string | null | undefined): number {
+        const scores: Record<string, number> = {
+            VERY_LIKELY: 0.9,
+            LIKELY: 0.7,
+            POSSIBLE: 0.5,
+            UNLIKELY: 0.3,
+            VERY_UNLIKELY: 0.1
+        };
+        return scores[likelihood || 'POSSIBLE'] || 0.5;
+    }
+
+    private determineAction(finding: any): string {
+        // Determine action based on info type and likelihood
+        if (finding.likelihood === 'VERY_LIKELY') {
+            return 'redact';
+        }
+        return 'mask';
+    }
+
+    private async checkCompliance(
+        data: any,
+        complianceConfig: PrivacyConfig['compliance']
+    ): Promise<PrivacyResult['compliance']> {
+        const violations: string[] = [];
+        const recommendations: string[] = [];
+
+        // Check GDPR compliance
+        if (complianceConfig.gdpr) {
+            const gdprViolations = await this.checkGDPRCompliance(data);
+            violations.push(...gdprViolations.violations);
+            recommendations.push(...gdprViolations.recommendations);
+        }
+
+        // Check HIPAA compliance
+        if (complianceConfig.hipaa) {
+            const hipaaViolations = await this.checkHIPAACompliance(data);
+            violations.push(...hipaaViolations.violations);
+            recommendations.push(...hipaaViolations.recommendations);
+        }
+
+        // Check CCPA compliance
+        if (complianceConfig.ccpa) {
+            const ccpaViolations = await this.checkCCPACompliance(data);
+            violations.push(...ccpaViolations.violations);
+            recommendations.push(...ccpaViolations.recommendations);
+        }
+
+        // Check custom rules
+        if (complianceConfig.customRules) {
+            const customViolations = await this.checkCustomRules(
+                data,
+                complianceConfig.customRules
+            );
+            violations.push(...customViolations.violations);
+            recommendations.push(...customViolations.recommendations);
+        }
+
+        return {
+            status: violations.length === 0 ? 'compliant' : 'non-compliant',
+            violations,
+            recommendations
+        };
+    }
+
+    private async checkGDPRCompliance(data: any): Promise<{
+        violations: string[];
+        recommendations: string[];
+    }> {
+        // Implement GDPR compliance checks
+        return {
+            violations: [],
+            recommendations: []
+        };
+    }
+
+    private async checkHIPAACompliance(data: any): Promise<{
+        violations: string[];
+        recommendations: string[];
+    }> {
+        // Implement HIPAA compliance checks
+        return {
+            violations: [],
+            recommendations: []
+        };
+    }
+
+    private async checkCCPACompliance(data: any): Promise<{
+        violations: string[];
+        recommendations: string[];
+    }> {
+        // Implement CCPA compliance checks
+        return {
+            violations: [],
+            recommendations: []
+        };
+    }
+
+    private async checkCustomRules(
+        data: any,
+        rules: ComplianceRule[]
+    ): Promise<{
+        violations: string[];
+        recommendations: string[];
+    }> {
+        // Implement custom rule checks
+        return {
+            violations: [],
+            recommendations: []
+        };
+    }
+
+    private calculateRiskLevel(result: PrivacyResult): PrivacyResult['stats']['riskLevel'] {
+        const highRiskTypes = new Set([
+            'CREDIT_CARD_NUMBER',
+            'SOCIAL_SECURITY_NUMBER',
+            'MEDICAL_RECORD_NUMBER'
+        ]);
+
+        const hasHighRiskData = result.findings.some(f => highRiskTypes.has(f.type));
+        if (hasHighRiskData || result.stats.piiCount > 10) {
+            return 'high';
+        }
+        if (result.stats.piiCount > 5) {
+            return 'medium';
+        }
+        return 'low';
+    }
+
+    private getAnonymizedValue(
+        finding: PrivacyFinding,
+        config: PrivacyConfig['anonymization']
+    ): string {
+        const value = finding.value;
+        switch (config.method) {
+            case 'mask':
+                return config.preserveLength ?
+                    value.replace(/./g, config.maskChar || '*') :
+                    '[REDACTED]';
+            case 'encrypt':
+                // Implement encryption
+                return '[ENCRYPTED]';
+            case 'redact':
+                return '[REDACTED]';
+            default:
+                return '[REDACTED]';
+        }
+    }
+
+    private replaceInString(
+        str: string,
+        start: number,
+        end: number,
+        replacement: string
+    ): string {
+        return str.substring(0, start) + replacement + str.substring(end);
+    }
+
+    private mergeConfig(
+        config?: Partial<PrivacyConfig>
+    ): PrivacyConfig {
+        return {
+            ...this.DEFAULT_CONFIG,
+            ...config,
+            piiDetection: {
+                ...this.DEFAULT_CONFIG.piiDetection,
+                ...config?.piiDetection
+            },
+            anonymization: {
+                ...this.DEFAULT_CONFIG.anonymization,
+                ...config?.anonymization
+            },
+            compliance: {
+                ...this.DEFAULT_CONFIG.compliance,
+                ...config?.compliance
+            }
+        };
+    }
+
+    private async validateComplianceRule(rule: ComplianceRule): Promise<void> {
+        if (!rule.name || !rule.pattern) {
+            throw new Error('Invalid compliance rule configuration');
+        }
+        
+        if (rule.pattern instanceof RegExp) {
+            try {
+                'test'.match(rule.pattern);
+            } catch {
+                throw new Error('Invalid regular expression in compliance rule');
+            }
+        }
+    }
+
+    private extractSensitiveDataTypes(findings: PrivacyFinding[]): string[] {
+        return [...new Set(findings.map(f => f.type))];
+    }
+
+    private async loadComplianceRules(): Promise<void> {
+        // Load compliance rules from storage
+    }
+
+    private setupEventListeners(): void {
+        this.eventBus.subscribe({
+            id: 'privacy-engine-monitor',
+            topic: 'data.update',
+            handler: async (event) => {
+                if (event.data.type === 'sensitive_data_update') {
+                    await this.handleSensitiveDataUpdate(event.data);
+                }
+            }
+        });
+    }
+
+    private async handleSensitiveDataUpdate(data: any): Promise<void> {
+        // Handle sensitive data updates
+        // This might involve re-scanning or updating privacy settings
+    }
+
+    private async handleError(type: string, error: Error): Promise<void> {
+        await this.monitor.recordMetric({
+            name: type,
+            value: 1,
+            labels: { error: error.message }
+        });
+
+        await this.eventBus.publish('privacy.error', {
+            type: 'privacy.error',
+            source: 'privacy-engine',
+            data: {
+                error: error.message,
+                timestamp: new Date()
+            },
+            metadata: {
+                severity: 'high',
+                environment: process.env.NODE_ENV || 'development'
+            }
+        });
+    }
+}
+

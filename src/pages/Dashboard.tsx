@@ -2,9 +2,11 @@ import React, { useState } from 'react';
 import ChatContainer from '../components/chat/ChatContainer';
 import TerminalContainer from '../components/terminal/TerminalContainer';
 import InterfaceToggle from '../components/interface/InterfaceToggle';
+import { GCPAIService } from '../ai/gcp-ai-service';
 
 export default function Dashboard() {
   const [interfaceMode, setInterfaceMode] = useState<'chat' | 'terminal'>('chat');
+  const aiService = useAIService(); // New hook for AI service
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
@@ -14,9 +16,9 @@ export default function Dashboard() {
         </div>
         <div className="bg-gray-800 rounded-lg h-[calc(100%-3rem)]">
           {interfaceMode === 'chat' ? (
-            <ChatContainer />
+            <ChatContainer aiService={aiService} />
           ) : (
-            <TerminalContainer />
+            <TerminalContainer aiService={aiService} />
           )}
         </div>
       </div>

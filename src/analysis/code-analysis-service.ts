@@ -50,7 +50,6 @@ export class CodeAnalysisService {
     ): Promise<CodeAnalysisResult> {
         const startTime = Date.now();
         try {
-            // Perform various analysis
             const complexityMetrics = await this.analyzeComplexity(code);
             const qualityMetrics = await this.analyzeCodeQuality(code);
             const securityReport = await this.performSecurityAnalysis(code);

@@ -68,36 +68,18 @@ export class AuditTrailService {
 
     async logEvent(event: Omit<AuditEvent, 'id' | 'timestamp'>): Promise<string> {
         try {
-            const auditEvent: AuditEvent = {
+            const id = this.generateEventId();
+            const fullEvent: AuditEvent = {
                 ...event,
-                id: this.generateEventId(),
+                id,
                 timestamp: new Date()
             };
-
-            // Store in BigQuery
-            await this.storeToBigQuery(auditEvent);
-
-            // Publish to PubSub for real-time processing
-            await this.publishToPubSub(auditEvent);
-
-            // Record metric
-            await this.monitor.recordMetric({
-                name: 'audit_event',
-                value: 1,
-                labels: {
-                    event_type: event.eventType,
-                    status: event.status
-                }
-            });
-
-            return auditEvent.id;
+            await this.storeToBigQuery(fullEvent);
+            await this.publishToPubSub(fullEvent);
+            return id;
         } catch (error) {
-            await this.monitor.recordMetric({
-                name: 'audit_error',
-                value: 1,
-                labels: { error: error.message }
-            });
-            throw error;
+            // Handle logging error (could also rethrow after recording metric)
+            throw new Error(`Audit log failed: ${error.message}`);
         }
     }
 
@@ -107,44 +89,21 @@ export class AuditTrailService {
     ): Promise<AuditEvent[]> {
         try {
             const query = this.buildQuery(filters, timeRange);
-            const [rows] = await this.bigquery
-                .dataset(this.datasetId)
-                .table(this.tableId)
-                .query(query);
-
+            // Execute query via BigQuery API (pseudo-code)
+            const [rows] = await this.bigquery.query({ query });
             return rows as AuditEvent[];
         } catch (error) {
-            await this.monitor.recordMetric({
-                name: 'audit_query_error',
-                value: 1,
-                labels: { error: error.message }
-            });
-            throw error;
+            throw new Error(`Query failed: ${error.message}`);
         }
     }
 
     async getEventById(eventId: string): Promise<AuditEvent | null> {
         try {
-            const query = `
-                SELECT *
-                FROM \`${this.datasetId}.${this.tableId}\`
-                WHERE id = @eventId
-            `;
-
-            const options = {
-                query,
-                params: { eventId }
-            };
-
-            const [rows] = await this.bigquery.query(options);
-            return rows[0] || null;
+            const query = `SELECT * FROM \`${this.datasetId}.${this.tableId}\` WHERE id = '${eventId}' LIMIT 1`;
+            const [rows] = await this.bigquery.query({ query });
+            return rows.length ? (rows[0] as AuditEvent) : null;
         } catch (error) {
-            await this.monitor.recordMetric({
-                name: 'audit_retrieval_error',
-                value: 1,
-                labels: { error: error.message }
-            });
-            throw error;
+            throw new Error(`Get event failed: ${error.message}`);
         }
     }
 
@@ -172,7 +131,7 @@ export class AuditTrailService {
             }
         } catch (error) {
             console.error('Failed to initialize audit infrastructure:', error);
-            throw error;
+            throw new Error(`Infrastructure setup failed: ${error.message}`);
         }
     }
 
@@ -206,27 +165,36 @@ export class AuditTrailService {
     }
 
     private async storeToBigQuery(event: AuditEvent): Promise<void> {
-        const row = this.formatEventForBigQuery(event);
-        await this.bigquery
-            .dataset(this.datasetId)
-            .table(this.tableId)
-            .insert([row]);
+        try {
+            const formatted = this.formatEventForBigQuery(event);
+            await this.bigquery
+                .dataset(this.datasetId)
+                .table(this.tableId)
+                .insert([formatted]);
+        } catch (error) {
+            throw new Error(`BigQuery insert failed: ${error.message}`);
+        }
     }
 
     private async publishToPubSub(event: AuditEvent): Promise<void> {
-        const topic = this.pubsub.topic(this.topicName);
-        const data = Buffer.from(JSON.stringify(event));
-        await topic.publish(data);
+        try {
+            const message = Buffer.from(JSON.stringify(event));
+            await this.pubsub.topic(this.topicName).publish(message);
+        } catch (error) {
+            throw new Error(`PubSub publish failed: ${error.message}`);
+        }
     }
 
     private formatEventForBigQuery(event: AuditEvent): Record<string, any> {
+        // Convert event to BigQuery row format
         return {
-            ...event,
+            id: event.id,
             timestamp: event.timestamp.toISOString(),
-            actor: {
-                ...event.actor,
-                metadata: JSON.stringify(event.actor.metadata)
-            },
+            eventType: event.eventType,
+            actor: JSON.stringify(event.actor),
+            resource: JSON.stringify(event.resource),
+            context: JSON.stringify(event.context),
+            status: event.status,
             details: JSON.stringify(event.details)
         };
     }
@@ -235,27 +203,17 @@ export class AuditTrailService {
         filters: Partial<AuditEvent>,
         timeRange: { start: Date; end: Date }
     ): string {
-        const conditions = [`timestamp BETWEEN @start AND @end`];
-
-        if (filters.eventType) {
-            conditions.push(`eventType = @eventType`);
+        let baseQuery = `SELECT * FROM \`${this.datasetId}.${this.tableId}\` WHERE timestamp BETWEEN '${timeRange.start.toISOString()}' AND '${timeRange.end.toISOString()}'`;
+        for (const key in filters) {
+            const value = (filters as any)[key];
+            if (value) {
+                baseQuery += ` AND ${key} = '${value}'`;
+            }
         }
-        if (filters.status) {
-            conditions.push(`status = @status`);
-        }
-        if (filters.actor?.id) {
-            conditions.push(`actor.id = @actorId`);
-        }
-
-        return `
-            SELECT *
-            FROM \`${this.datasetId}.${this.tableId}\`
-            WHERE ${conditions.join(' AND ')}
-            ORDER BY timestamp DESC
-        `;
+        return baseQuery;
     }
 
     private generateEventId(): string {
-        return `evt-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        return `audit_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     }
 }

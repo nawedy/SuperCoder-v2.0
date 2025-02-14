@@ -1,96 +1,123 @@
 import { MonitoringService } from '../monitoring/monitoring-service';
-import { AuditTrailService } from '../audit/audit-trail-service';
 import { PubSub, Topic, Subscription } from '@google-cloud/pubsub';
+import { v4 as uuidv4 } from 'uuid';
 
-interface EventSubscription {
-    id: string;
-    topic: string;
-    handler: (event: SystemEvent) => Promise<void>;
-    filter?: (event: SystemEvent) => boolean;
-    errorHandler?: (error: Error, event: SystemEvent) => Promise<void>;
-    options: {
-        retryPolicy?: {
-            maxRetries: number;
-            backoffSeconds: number;
-        };
-        deadLetterTopic?: string;
-        orderingKey?: string;
-    };
-}
-
-interface SystemEvent {
+interface Event {
     id: string;
     type: string;
     source: string;
-    timestamp: Date;
     data: any;
     metadata: {
-        correlationId?: string;
-        causationId?: string;
-        version: string;
+        timestamp: Date;
+        correlation_id?: string;
+        causation_id?: string;
+        severity: 'low' | 'medium' | 'high';
         environment: string;
     };
 }
 
+interface Subscriber {
+    id: string;
+    topic: string;
+    handler: (event: Event) => Promise<void>;
+    filter?: (event: Event) => boolean;
+    retryConfig?: {
+        maxRetries: number;
+        backoff: {
+            initialDelayMs: number;
+            maxDelayMs: number;
+            multiplier: number;
+        };
+    };
+}
+
+interface PublishOptions {
+    priority?: 'high' | 'normal' | 'low';
+    deduplicationId?: string;
+    delaySeconds?: number;
+}
+
 export class EventBusService {
     private monitor: MonitoringService;
-    private audit: AuditTrailService;
     private pubsub: PubSub;
     private topics: Map<string, Topic>;
     private subscriptions: Map<string, Subscription>;
-    private handlers: Map<string, EventSubscription[]>;
+    private subscribers: Map<string, Subscriber>;
+    private readonly MAX_BATCH_SIZE = 1000;
+    private readonly DEFAULT_RETRY_CONFIG = {
+        maxRetries: 3,
+        backoff: {
+            initialDelayMs: 100,
+            maxDelayMs: 10000,
+            multiplier: 2
+        }
+    };
 
     constructor(
         monitor: MonitoringService,
-        audit: AuditTrailService,
-        projectId: string
+        config: {
+            projectId: string;
+        }
     ) {
         this.monitor = monitor;
-        this.audit = audit;
-        this.pubsub = new PubSub({ projectId });
+        this.pubsub = new PubSub({ projectId: config.projectId });
         this.topics = new Map();
         this.subscriptions = new Map();
-        this.handlers = new Map();
+        this.subscribers = new Map();
 
         this.initialize();
     }
 
     private async initialize(): Promise<void> {
-        await this.setupDefaultTopics();
+        await this.setupInfrastructure();
+        this.startErrorMonitoring();
     }
 
     async publish(
         topic: string,
-        event: Omit<SystemEvent, 'id' | 'timestamp'>
+        event: Omit<Event, 'id' | 'metadata'>,
+        options?: PublishOptions
     ): Promise<string> {
         const startTime = Date.now();
         try {
-            const pubsubTopic = await this.ensureTopic(topic);
-            
-            const fullEvent: SystemEvent = {
+            // Generate event ID and metadata
+            const eventId = uuidv4();
+            const fullEvent: Event = {
                 ...event,
-                id: this.generateEventId(),
-                timestamp: new Date(),
+                id: eventId,
+                metadata: {
+                    timestamp: new Date(),
+                    severity: options?.priority || 'normal',
+                    environment: process.env.NODE_ENV || 'development'
+                }
             };
 
+            // Get or create topic
+            const pubsubTopic = await this.getOrCreateTopic(topic);
+
+            // Prepare message attributes
+            const attributes = {
+                event_id: eventId,
+                event_type: event.type,
+                source: event.source,
+                priority: options?.priority || 'normal',
+                deduplication_id: options?.deduplicationId || eventId
+            };
+
+            // Publish event
             const messageId = await pubsubTopic.publish(
                 Buffer.from(JSON.stringify(fullEvent)),
-                {
-                    eventId: fullEvent.id,
-                    eventType: fullEvent.type,
-                    source: fullEvent.source,
-                    timestamp: fullEvent.timestamp.toISOString(),
-                    correlationId: fullEvent.metadata.correlationId
-                }
+                attributes
             );
 
+            // Record metrics
             await this.monitor.recordMetric({
                 name: 'event_published',
                 value: Date.now() - startTime,
                 labels: {
                     topic,
                     event_type: event.type,
-                    source: event.source
+                    priority: options?.priority || 'normal'
                 }
             });
 
@@ -102,76 +129,47 @@ export class EventBusService {
         }
     }
 
-    async subscribe(subscription: EventSubscription): Promise<() => Promise<void>> {
+    async subscribe(subscriber: Subscriber): Promise<void> {
         try {
-            const pubsubTopic = await this.ensureTopic(subscription.topic);
+            // Get or create topic
+            const topic = await this.getOrCreateTopic(subscriber.topic);
 
-            const subName = this.generateSubscriptionName(
-                subscription.topic,
-                subscription.id
-            );
+            // Create subscription name
+            const subscriptionName = `${subscriber.topic}-${subscriber.id}`;
 
-            const pubsubSubscription = await this.ensureSubscription(
-                pubsubTopic,
-                subName,
-                subscription.options
-            );
+            // Create subscription
+            const [subscription] = await topic.createSubscription(subscriptionName, {
+                retryPolicy: subscriber.retryConfig || this.DEFAULT_RETRY_CONFIG
+            });
 
-            const existingHandlers = this.handlers.get(subscription.topic) || [];
-            this.handlers.set(subscription.topic, [...existingHandlers, subscription]);
+            // Store subscriber
+            this.subscribers.set(subscriber.id, subscriber);
+            this.subscriptions.set(subscriber.id, subscription);
 
             // Setup message handler
-            pubsubSubscription.on('message', async (message) => {
+            subscription.on('message', async (message) => {
                 try {
-                    const event = JSON.parse(message.data.toString()) as SystemEvent;
+                    const event: Event = JSON.parse(message.data.toString());
 
-                    if (!subscription.filter || subscription.filter(event)) {
-                        await subscription.handler(event);
+                    // Apply filter if exists
+                    if (subscriber.filter && !subscriber.filter(event)) {
+                        message.ack();
+                        return;
                     }
 
+                    // Process event
+                    await this.processEvent(subscriber, event);
                     message.ack();
 
                 } catch (error) {
-                    if (subscription.errorHandler) {
-                        await subscription.errorHandler(error, JSON.parse(message.data.toString()));
-                    }
+                    await this.handleError('event_processing_error', error);
                     message.nack();
                 }
             });
 
-            // Setup error handler
-            pubsubSubscription.on('error', async (error) => {
+            subscription.on('error', async (error) => {
                 await this.handleError('subscription_error', error);
             });
-
-            await this.audit.logEvent({
-                eventType: 'system.config',
-                actor: {
-                    id: 'system',
-                    type: 'service',
-                    metadata: {}
-                },
-                resource: {
-                    type: 'event-subscription',
-                    id: subscription.id,
-                    action: 'create'
-                },
-                context: {
-                    location: 'event-bus',
-                    ipAddress: 'internal',
-                    userAgent: 'system'
-                },
-                status: 'success',
-                details: {
-                    topic: subscription.topic,
-                    subscription_name: subName
-                }
-            });
-
-            // Return unsubscribe function
-            return async () => {
-                await this.unsubscribe(subscription.topic, subscription.id);
-            };
 
         } catch (error) {
             await this.handleError('subscription_creation_error', error);
@@ -179,91 +177,78 @@ export class EventBusService {
         }
     }
 
-    private async unsubscribe(topic: string, subscriptionId: string): Promise<void> {
+    async unsubscribe(subscriberId: string): Promise<void> {
         try {
-            const subName = this.generateSubscriptionName(topic, subscriptionId);
-            const subscription = this.subscriptions.get(subName);
-
+            const subscription = this.subscriptions.get(subscriberId);
             if (subscription) {
-                await subscription.close();
-                this.subscriptions.delete(subName);
-
-                // Remove handler
-                const handlers = this.handlers.get(topic) || [];
-                this.handlers.set(
-                    topic,
-                    handlers.filter(h => h.id !== subscriptionId)
-                );
+                await subscription.delete();
+                this.subscriptions.delete(subscriberId);
+                this.subscribers.delete(subscriberId);
             }
-
         } catch (error) {
             await this.handleError('unsubscribe_error', error);
             throw error;
         }
     }
 
-    private async setupDefaultTopics(): Promise<void> {
-        const defaultTopics = [
-            'system.events',
-            'model.events',
-            'security.events',
-            'audit.events'
-        ];
+    private async processEvent(
+        subscriber: Subscriber,
+        event: Event
+    ): Promise<void> {
+        const startTime = Date.now();
+        try {
+            await subscriber.handler(event);
 
-        for (const topic of defaultTopics) {
-            await this.ensureTopic(topic);
+            // Record metrics
+            await this.monitor.recordMetric({
+                name: 'event_processed',
+                value: Date.now() - startTime,
+                labels: {
+                    subscriber_id: subscriber.id,
+                    topic: subscriber.topic,
+                    event_type: event.type
+                }
+            });
+
+        } catch (error) {
+            await this.handleError('event_handler_error', error);
+            throw error;
         }
     }
 
-    private async ensureTopic(name: string): Promise<Topic> {
-        if (this.topics.has(name)) {
-            return this.topics.get(name)!;
-        }
+    private async getOrCreateTopic(name: string): Promise<Topic> {
+        // Check cache
+        const cached = this.topics.get(name);
+        if (cached) return cached;
 
+        // Get or create topic
         const [topic] = await this.pubsub.topic(name).get({
             autoCreate: true
         });
 
+        // Cache topic
         this.topics.set(name, topic);
         return topic;
     }
 
-    private async ensureSubscription(
-        topic: Topic,
-        name: string,
-        options: EventSubscription['options']
-    ): Promise<Subscription> {
-        if (this.subscriptions.has(name)) {
-            return this.subscriptions.get(name)!;
-        }
+    private async setupInfrastructure(): Promise<void> {
+        // Create default topics
+        const defaultTopics = [
+            'system.events',
+            'security.alerts',
+            'model.updates',
+            'data.changes'
+        ];
 
-        const [subscription] = await topic.createSubscription(name, {
-            retryPolicy: options.retryPolicy && {
-                maximumRetries: options.retryPolicy.maxRetries,
-                minimumBackoff: {
-                    seconds: options.retryPolicy.backoffSeconds
-                },
-                maximumBackoff: {
-                    seconds: options.retryPolicy.backoffSeconds * 10
-                }
-            },
-            deadLetterPolicy: options.deadLetterTopic && {
-                deadLetterTopic: options.deadLetterTopic,
-                maxDeliveryAttempts: options.retryPolicy?.maxRetries || 5
-            },
-            enableMessageOrdering: !!options.orderingKey
+        await Promise.all(
+            defaultTopics.map(topic => this.getOrCreateTopic(topic))
+        );
+    }
+
+    private startErrorMonitoring(): void {
+        this.pubsub.on('error', async (error) => {
+            await this.handleError('pubsub_error', error);
         });
-
-        this.subscriptions.set(name, subscription);
-        return subscription;
-    }
-
-    private generateSubscriptionName(topic: string, id: string): string {
-        return `${topic.replace(/\./g, '-')}-${id}`;
-    }
-
-    private generateEventId(): string {
-        return `evt-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     }
 
     private async handleError(type: string, error: Error): Promise<void> {
@@ -272,5 +257,21 @@ export class EventBusService {
             value: 1,
             labels: { error: error.message }
         });
+
+        // Self-publish error event
+        try {
+            await this.publish('system.events', {
+                type: 'event_bus.error',
+                source: 'event-bus',
+                data: {
+                    error: error.message,
+                    type,
+                    timestamp: new Date()
+                }
+            });
+        } catch (e) {
+            // Avoid infinite recursion
+            console.error('Failed to publish error event:', e);
+        }
     }
 }

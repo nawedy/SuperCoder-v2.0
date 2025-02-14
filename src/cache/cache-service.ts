@@ -2,10 +2,9 @@ import { MonitoringService } from '../monitoring/monitoring-service';
 import { Redis } from 'ioredis';
 import { SecurityConfig } from '../config/security-config';
 
-interface CacheConfig {
-    ttl: number;
-    maxSize: number;
-    encryption: boolean;
+export interface CacheConfig {
+    enabled: boolean;
+    ttl: number; // TTL in seconds
 }
 
 interface CacheStats {
@@ -194,5 +193,29 @@ export class CacheService {
     private async encryptValue(value: any): Promise<string> {
         // Implement encryption logic using KMS
         return JSON.stringify(value);
+    }
+}
+
+export class Cache {
+    private config: CacheConfig;
+    private store: Map<string, { value: any; expires: number }>;
+
+    constructor(config: CacheConfig) {
+        this.config = config;
+        this.store = new Map();
+    }
+
+    async get(key: string): Promise<any | null> {
+        const entry = this.store.get(key);
+        if (entry && Date.now() < entry.expires) {
+            return entry.value;
+        }
+        this.store.delete(key);
+        return null;
+    }
+
+    async set(key: string, value: any, ttl?: number): Promise<void> {
+        const expireTime = Date.now() + ((ttl || this.config.ttl) * 1000);
+        this.store.set(key, { value, expires: expireTime });
     }
 }
